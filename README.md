@@ -5,10 +5,103 @@ opens the app's local URL in the operating system's own webview (WebView2,
 WKWebView or WebKitGTK), so the launcher stays around 1–3 MB instead of
 shipping a browser.
 
-> **Status: v0.2.** Porthole can start your backend as a sidecar and open a
-> window on it, or open a window on a server you have already started.
-> Packing everything into a single executable (v0.3) is next. See the
-> [roadmap](#roadmap).
+> **Status: v0.3.** Porthole can start your backend as a sidecar, serve a
+> static site itself, or open a window on a server you have already
+> started, and `pack` turns any of the first two into a single executable.
+> The auth kit (v0.4) is next. See the [roadmap](#roadmap).
+
+## Pack an app into one executable
+
+```sh
+porthole pack app.toml -o MyApp          # MyApp.exe on Windows
+porthole inspect MyApp                   # what's inside
+./MyApp                                  # runs the app
+```
+
+`pack` copies the `porthole` binary, appends your app (the sidecar or the
+static site, plus `app.toml`) as a zstd-compressed tar payload, and ends
+the file with a small footer. The operating system ignores the trailing
+bytes, so the result is a normal executable. When it starts, it finds its
+own payload and runs the app; a `porthole` binary without a payload is the
+command-line tool.
+
+| Flag | Meaning |
+| --- | --- |
+| `-o`, `--output <FILE>` | Where to write the executable. Default: `<app.name>` in the current folder |
+| `--devtools` | Allow the web inspector in the packed app (off by default) |
+
+`pack` bundles `sidecar.path` (one file or a whole folder, for runtimes
+such as Python, Node or .NET) or `static.root`, plus `app.icon` if set.
+Unix permission bits and symlinks are kept, so executables still run after
+unpacking. It packs for the platform it runs on: build Windows apps on
+Windows, and so on. Cross-packing, code signing and macOS `.app` bundles
+arrive in v0.5; sign *after* packing.
+
+**At launch**, a packed sidecar app unpacks once per version into
+`<cache dir>/porthole/<first 16 hex digits of the payload's sha256>/`
+(`%LOCALAPPDATA%`, `~/Library/Caches` or `$XDG_CACHE_HOME`), verifying the
+sha256 on the way, and runs from there on every later launch. Unpacking
+goes to a temporary folder that is renamed into place, so a crash or a
+second instance never sees a half-written copy. Cache folders of versions
+not launched for 30 days are deleted. Static sites skip the cache and are
+served from memory (see below).
+
+A packed app accepts two flags of its own; anything else on its command
+line is ignored:
+
+| Flag | Meaning |
+| --- | --- |
+| `--console` | Stream the logs to the terminal (as `run --console` does) |
+| `--verify` | Throw away the cached copy and unpack afresh from the verified payload |
+
+Set `PORTHOLE_CACHE_DIR` to use another cache folder.
+
+### Packed file format
+
+```
+[ launcher binary ][ payload: tar.zst ][ footer: 58 bytes ]
+```
+
+The footer is little-endian: `magic` (8 bytes, `PRTHOLE\0`), `version`
+(2, currently 1), `payload_offset` (8), `payload_len` (8) and `sha256` (32,
+of the compressed payload). The payload holds `app.toml` (with its paths
+rewritten to point into the payload), `pack.toml` (the Porthole version
+and `--devtools`), the optional icon, and `app/`.
+
+## Serve a static site
+
+A frontend-only app needs no backend at all. Use `[static]` instead of
+`[sidecar]`:
+
+```toml
+[app]
+name = "MyApp"
+id = "com.example.myapp"
+
+[static]
+root = "web/"               # folder of HTML/CSS/JS/WASM, relative to app.toml
+spa_fallback = true         # unknown extensionless paths serve index.html (client-side routers)
+# csp = "default-src 'self'"   # replaces the default Content-Security-Policy
+# in_memory_limit_mb = 64      # packed sites larger than this are served from the cache folder
+```
+
+Porthole answers the webview's requests itself through a custom protocol,
+`porthole://localhost/` (`http://porthole.localhost/` on Windows), so there
+is no port and nothing else on the machine can reach the files. `porthole
+run app.toml` serves the folder from disk, which is handy while
+developing; a packed app holds the whole site in memory. See
+[`examples/hello-static`](examples/hello-static).
+
+- `Content-Type` comes from the file extension, including
+  `application/wasm` for streaming WebAssembly compilation.
+- `/` and folders serve their `index.html`. Missing files get a 404 page.
+- The default Content-Security-Policy only lets scripts load from the app
+  itself (no remote or inline scripts), and allows remote images, styles,
+  fonts and HTTPS API calls. Set `static.csp` to replace it.
+- The origin is the same on every launch, so `localStorage`, IndexedDB and
+  cookies persist.
+- A static app can't also run a sidecar in v1; put the frontend in the
+  sidecar instead.
 
 ## Run your backend as a sidecar
 
@@ -173,7 +266,7 @@ use Python, and skip themselves where it is not installed.
 2. **v0.2 — Sidecar.** `run app.toml` starts your backend with `APP_PORT`,
    `APP_TOKEN` and `APP_DATA_DIR`, waits for it, and stops it with the window.
 3. **v0.3 — Pack.** `pack` and `inspect`: one executable with the backend
-   (or a static site) inside.
+   (or a static site, served from memory) inside.
 4. **v0.4 — Auth kit.** The token handshake spec and reference middlewares.
 5. **v0.5 — Release polish.** Title bar modes, downloads, signing,
    cross-packing, prebuilt launchers.

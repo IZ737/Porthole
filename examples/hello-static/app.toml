@@ -1,0 +1,17 @@
+# A frontend-only app: Porthole serves the `web/` folder itself, with no
+# backend and no network port.
+#
+#   porthole run examples/hello-static/app.toml     # straight from disk
+#   porthole pack examples/hello-static/app.toml    # one executable
+
+[app]
+name = "Hello Static"
+id = "dev.porthole.hello-static"
+
+[window]
+width = 800
+height = 600
+
+[static]
+root = "web/"
+spa_fallback = true

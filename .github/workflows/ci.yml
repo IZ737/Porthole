@@ -86,6 +86,39 @@ jobs:
             if pgrep -x -f "python3 server.py"; then echo "backend outlived porthole"; exit 1; fi
           '
 
+      # Packs both examples, checks `inspect`, and runs the packed sidecar
+      # app (it must unpack, start its backend, and take the backend down
+      # when killed) and the packed static app.
+      - name: Smoke test, packed apps (Linux)
+        if: runner.os == 'Linux'
+        env:
+          PORTHOLE_NO_DIALOGS: '1'
+          PORTHOLE_CACHE_DIR: /tmp/porthole-cache
+        run: |
+          ./target/release/porthole pack examples/hello-python/app.toml -o /tmp/HelloPython
+          ./target/release/porthole pack examples/hello-static/app.toml -o /tmp/HelloStatic
+          ./target/release/porthole inspect /tmp/HelloPython | grep -q 'sha256.*(matches)'
+          ./target/release/porthole inspect /tmp/HelloStatic | grep -q 'served from memory'
+          xvfb-run -a bash -c '
+            /tmp/HelloPython --console & pid=$!
+            sleep 5
+            kill -0 $pid || { echo "packed app exited early"; exit 1; }
+            pgrep -x -f "python3 server.py" || { echo "backend is not running"; exit 1; }
+            ls /tmp/porthole-cache/*/.complete || { echo "no cache folder"; exit 1; }
+            kill -9 $pid
+            sleep 2
+            if pgrep -x -f "python3 server.py"; then echo "backend outlived porthole"; exit 1; fi
+          '
+          xvfb-run -a bash -c '
+            /tmp/HelloStatic --console > /tmp/static.log 2>&1 & pid=$!
+            sleep 5
+            cat /tmp/static.log
+            kill -0 $pid || { echo "packed static app exited early"; exit 1; }
+            kill $pid
+            grep -q "loaded .* files into memory" /tmp/static.log
+            if grep -q "no file for" /tmp/static.log; then echo "a page asset 404ed"; exit 1; fi
+          '
+
       - uses: actions/upload-artifact@v4
         with:
           name: porthole-${{ runner.os }}-${{ runner.arch }}

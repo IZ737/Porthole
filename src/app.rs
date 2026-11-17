@@ -1,35 +1,135 @@
-//! `porthole run app.toml`: start the backend as a sidecar and open a
-//! window on it.
+//! Running an app: `porthole run app.toml` in development, or a packed exe.
 //!
 //! Order of events:
-//! 1. Read `app.toml`, create `APP_DATA_DIR`, start logging.
+//! 1. Read `app.toml` (from disk, or from the front of the payload), create
+//!    `APP_DATA_DIR`, start logging.
 //! 2. Take the single-instance lock (a second launch focuses the first
-//!    window and exits).
-//! 3. Pick a port and token, spawn the sidecar.
-//! 4. Wait for readiness; on failure show an error dialog with the log tail.
-//! 5. Open the window at `http://127.0.0.1:<port>/?token=<token>`.
-//! 6. On close (or if the sidecar dies), stop the sidecar and exit.
+//!    window and exits) before unpacking or spawning anything.
+//! 3. Packed apps: unpack the payload into the extract-once cache (sidecar,
+//!    or a static site over the in-memory limit), or into memory (static).
+//! 4. Sidecar: pick a port and token, spawn the sidecar, wait for
+//!    readiness (on failure show an error dialog with the log tail), and
+//!    open the window at `http://127.0.0.1:<port>/?token=<token>`.
+//!    Static: open the window at the `porthole://` custom protocol.
+//! 5. On close (or if the sidecar dies), stop the sidecar and exit.
 
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
-use std::time::Instant;
+use std::sync::Arc;
+use std::time::{Instant, SystemTime};
 
 use anyhow::{Context, Result};
 use url::Url;
 
-use crate::config::{self, Config};
+use crate::cache;
+use crate::config::{self, Config, Mode, SidecarSection, StaticSection};
 use crate::dialog::{self, ErrorReport};
-use crate::instance::{self, Instance};
+use crate::instance::{self, Instance, Primary};
 use crate::logs;
+use crate::payload::{Footer, PackInfo, Payload};
 use crate::sidecar::{self, Sidecar};
-use crate::window::{self, Hooks, WindowOptions};
+use crate::static_site::{self, Files, StaticSite};
+use crate::window::{self, CustomProtocol, Hooks, WindowOptions};
 use crate::window_state;
 
 /// Options from the command line.
 pub struct RunOptions {
     pub devtools: bool,
     pub console: bool,
+    /// Packed apps: unpack afresh instead of trusting the cache.
+    pub verify: bool,
+}
+
+/// An error that has already been shown to the user in a dialog.
+#[derive(Debug)]
+pub struct Reported(pub String);
+
+impl std::fmt::Display for Reported {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for Reported {}
+
+/// A packed exe's payload.
+struct Bundle {
+    exe: PathBuf,
+    footer: Footer,
+    info: PackInfo,
+    cache_root: PathBuf,
+}
+
+impl Bundle {
+    /// Unpack into the cache (once per version), and prune old versions in
+    /// the background.
+    fn unpack(&self, fresh: bool) -> Result<PathBuf> {
+        cache::ensure_extracted(&self.cache_root, &self.exe, &self.footer, fresh)
+    }
+
+    /// Delete cache folders of other versions untouched for 30 days. Runs
+    /// in the background so it never delays the window.
+    fn prune_in_background(&self) {
+        let root = self.cache_root.clone();
+        let keep = self.footer.cache_key();
+        std::thread::spawn(move || {
+            for path in cache::prune(&root, &keep, SystemTime::now()) {
+                logs::info!("pruned the unused cache folder {}", path.display());
+            }
+        });
+    }
+
+    /// The static site's files: in memory if they fit under the limit,
+    /// otherwise unpacked to the cache.
+    fn static_files(&self, st: &StaticSection, fresh: bool) -> Result<Files> {
+        if self.info.unpacked_bytes <= st.in_memory_limit {
+            let started = Instant::now();
+            let payload = Payload::new(&self.exe, &self.footer);
+            if let Some(files) = payload.load_app_files(st.in_memory_limit)? {
+                logs::info!(
+                    "loaded {} files into memory in {:.2}s",
+                    files.len(),
+                    started.elapsed().as_secs_f64()
+                );
+                return Ok(Files::memory(files));
+            }
+        }
+        logs::info!(
+            "the site is larger than `static.in_memory_limit_mb`; serving it from the cache folder"
+        );
+        self.unpack(fresh)?;
+        Ok(Files::Disk(st.root.clone()))
+    }
+}
+
+/// `porthole run app.toml`.
+pub fn run_dev(config_path: &Path, opts: RunOptions) -> Result<()> {
+    let config = Config::load(config_path)?;
+    launch(config, &config_path.display().to_string(), None, opts)
+}
+
+/// A packed exe: everything comes from the payload at the end of `exe`.
+pub fn run_packed(exe: PathBuf, footer: Footer, opts: RunOptions) -> Result<()> {
+    let payload = Payload::new(&exe, &footer);
+    let (app_toml, info) = payload.read_meta()?;
+    let cache_root = cache::root()?;
+    // Paths in the packed app.toml point into the cache folder.
+    let config = Config::parse(&app_toml, &cache::folder(&cache_root, &footer))
+        .context("the packed app.toml is invalid")?;
+    let label = format!("{} (packed, sha256 {})", exe.display(), footer.cache_key());
+    let opts = RunOptions {
+        // Only `pack --devtools` enables the inspector in a packed app.
+        devtools: info.devtools,
+        ..opts
+    };
+    let bundle = Bundle {
+        exe,
+        footer,
+        info,
+        cache_root,
+    };
+    launch(config, &label, Some(bundle), opts)
 }
 
 /// The per-user data folder for `app.id`, passed to the backend as
@@ -41,9 +141,7 @@ pub fn data_dir(app_id: &str) -> Result<PathBuf> {
     Ok(base.data_dir().join(app_id))
 }
 
-pub fn run(config_path: &Path, opts: RunOptions) -> Result<()> {
-    let config = Config::load(config_path)?;
-
+fn launch(config: Config, label: &str, bundle: Option<Bundle>, opts: RunOptions) -> Result<()> {
     let data_dir = data_dir(&config.app.id)?;
     std::fs::create_dir_all(&data_dir)
         .with_context(|| format!("could not create {}", data_dir.display()))?;
@@ -57,7 +155,7 @@ pub fn run(config_path: &Path, opts: RunOptions) -> Result<()> {
         "porthole {} starting {} ({})",
         env!("CARGO_PKG_VERSION"),
         config.app.name,
-        config_path.display()
+        label
     );
     for warning in config.warnings() {
         logs::warning!("{warning}");
@@ -82,12 +180,111 @@ pub fn run(config_path: &Path, opts: RunOptions) -> Result<()> {
             log_tail: tail,
             logs_dir: Some(logs_dir.clone()),
         });
-        anyhow::anyhow!(message)
+        anyhow::Error::new(Reported(message))
     };
 
+    if let Some(b) = &bundle {
+        b.prune_in_background();
+    }
+    let window_opts = window_options(&config, &data_dir, opts.devtools);
+    match &config.mode {
+        Mode::Sidecar(sc) => {
+            if let Some(b) = &bundle
+                && let Err(err) = b.unpack(opts.verify)
+            {
+                return Err(fail(format!("{err:#}"), vec![]));
+            }
+            run_sidecar(
+                &config,
+                sc,
+                &data_dir,
+                &logs_dir,
+                instance,
+                window_opts,
+                &fail,
+            )
+        }
+        Mode::Static(st) => {
+            let files = match &bundle {
+                Some(b) => b.static_files(st, opts.verify),
+                None if st.root.is_dir() => Ok(Files::Disk(st.root.clone())),
+                None => Err(anyhow::anyhow!(
+                    "`static.root` {} is not a folder",
+                    st.root.display()
+                )),
+            };
+            let files = files.map_err(|err| fail(format!("{err:#}"), vec![]))?;
+            let site = StaticSite {
+                files,
+                spa_fallback: st.spa_fallback,
+                csp: st
+                    .csp
+                    .clone()
+                    .unwrap_or_else(|| static_site::DEFAULT_CSP.to_owned()),
+            };
+            run_static(site, instance, window_opts)
+        }
+    }
+}
+
+fn window_options(config: &Config, data_dir: &Path, devtools: bool) -> WindowOptions {
+    WindowOptions {
+        title: Some(config.title().to_owned()),
+        width: config.window.width,
+        height: config.window.height,
+        resizable: config.window.resizable,
+        devtools,
+        theme: match config.window.theme {
+            config::Theme::Light => Some(tao::window::Theme::Light),
+            config::Theme::Dark => Some(tao::window::Theme::Dark),
+            config::Theme::System => None,
+        },
+        state_file: config
+            .window
+            .remember_window
+            .then(|| data_dir.join(window_state::FILE_NAME)),
+        webview_data_dir: Some(data_dir.join("webview")),
+        protocol: None,
+    }
+}
+
+/// Hand focus requests from later launches to the window.
+fn listen_for_focus(instance: Option<Primary>, handle: &window::WindowHandle) {
+    if let Some(primary) = instance {
+        let focus = handle.clone();
+        match primary.listen(move || focus.focus()) {
+            // The guard holds the lock for the life of the process.
+            Ok(guard) => std::mem::forget(guard),
+            Err(err) => logs::warning!("single-instance listener failed: {err:#}"),
+        }
+    }
+}
+
+fn run_static(site: StaticSite, instance: Option<Primary>, mut opts: WindowOptions) -> Result<()> {
+    let site = Arc::new(site);
+    opts.protocol = Some(CustomProtocol {
+        scheme: static_site::SCHEME,
+        handler: Arc::new(move |request| site.handle(request)),
+    });
+    let hooks = Hooks {
+        on_open: Some(Box::new(move |handle| listen_for_focus(instance, &handle))),
+        on_exit: Some(Box::new(|| logs::info!("exiting"))),
+    };
+    window::open(static_site::start_url(), opts, hooks)
+}
+
+fn run_sidecar(
+    config: &Config,
+    sc: &SidecarSection,
+    data_dir: &Path,
+    logs_dir: &Path,
+    instance: Option<Primary>,
+    window_opts: WindowOptions,
+    fail: &dyn Fn(String, Vec<String>) -> anyhow::Error,
+) -> Result<()> {
     // Spawn on the main thread: see `Sidecar::spawn` about Linux's
     // parent-death signal.
-    let (spec, port, token) = match sidecar_spec(&config, &data_dir, &logs_dir) {
+    let (spec, port, token) = match sidecar_spec(config, sc, data_dir, logs_dir) {
         Ok(v) => v,
         Err(err) => return Err(fail(format!("{err:#}"), vec![])),
     };
@@ -104,11 +301,7 @@ pub fn run(config_path: &Path, opts: RunOptions) -> Result<()> {
     };
     logs::info!("backend pid {}", sidecar.pid());
 
-    if let Err(err) = sidecar.wait_ready(
-        port,
-        config.sidecar.ready_path.as_deref(),
-        config.sidecar.ready_timeout,
-    ) {
+    if let Err(err) = sidecar.wait_ready(port, sc.ready_path.as_deref(), sc.ready_timeout) {
         sidecar.shutdown();
         return Err(fail(format!("{err:#}"), sidecar.log_tail()));
     }
@@ -121,16 +314,10 @@ pub fn run(config_path: &Path, opts: RunOptions) -> Result<()> {
     let sidecar = Rc::new(RefCell::new(sidecar));
     let on_open_sidecar = sidecar.clone();
     let app_name = config.app.name.clone();
+    let logs_dir = logs_dir.to_path_buf();
     let hooks = Hooks {
         on_open: Some(Box::new(move |handle| {
-            if let Some(primary) = instance {
-                let focus = handle.clone();
-                match primary.listen(move || focus.focus()) {
-                    // The guard holds the lock for the life of the process.
-                    Ok(guard) => std::mem::forget(guard),
-                    Err(err) => logs::warning!("single-instance listener failed: {err:#}"),
-                }
-            }
+            listen_for_focus(instance, &handle);
             on_open_sidecar
                 .borrow()
                 .on_unexpected_exit(move |status, tail| {
@@ -151,37 +338,17 @@ pub fn run(config_path: &Path, opts: RunOptions) -> Result<()> {
         })),
     };
 
-    window::open(
-        url,
-        WindowOptions {
-            title: Some(config.title().to_owned()),
-            width: config.window.width,
-            height: config.window.height,
-            resizable: config.window.resizable,
-            devtools: opts.devtools,
-            theme: match config.window.theme {
-                config::Theme::Light => Some(tao::window::Theme::Light),
-                config::Theme::Dark => Some(tao::window::Theme::Dark),
-                config::Theme::System => None,
-            },
-            state_file: config
-                .window
-                .remember_window
-                .then(|| data_dir.join(window_state::FILE_NAME)),
-            webview_data_dir: Some(data_dir.join("webview")),
-        },
-        hooks,
-    )
+    window::open(url, window_opts, hooks)
 }
 
 /// The sidecar's command line and environment, plus the port and token.
 fn sidecar_spec(
     config: &Config,
+    sc: &SidecarSection,
     data_dir: &Path,
     logs_dir: &Path,
 ) -> Result<(sidecar::Spec, u16, Option<String>)> {
-    let (program, cwd) =
-        sidecar::resolve_program(&config.sidecar.path, config.sidecar.command.as_deref())?;
+    let (program, cwd) = sidecar::resolve_program(&sc.path, sc.command.as_deref())?;
     let port = sidecar::pick_port().context("could not find a free port")?;
     let token = if config.auth.enabled {
         Some(sidecar::random_hex(32)?)
@@ -197,11 +364,11 @@ fn sidecar_spec(
     }
     let spec = sidecar::Spec {
         program,
-        args: config.sidecar.args.clone(),
+        args: sc.args.clone(),
         cwd,
         env,
         log_file: Some(logs_dir.join("sidecar.log")),
-        shutdown_grace: config.sidecar.shutdown_grace,
+        shutdown_grace: sc.shutdown_grace,
     };
     Ok((spec, port, token))
 }
@@ -232,6 +399,13 @@ mod tests {
         );
     }
 
+    fn sidecar_of(config: &Config) -> &SidecarSection {
+        match &config.mode {
+            Mode::Sidecar(s) => s,
+            Mode::Static(_) => panic!("not a sidecar app"),
+        }
+    }
+
     #[test]
     fn spec_sets_env() {
         let dir = std::env::temp_dir().join(format!("porthole-app-{}", std::process::id()));
@@ -239,8 +413,13 @@ mod tests {
         std::fs::write(dir.join("server.py"), "").unwrap();
         let text = "[app]\nname = \"A\"\nid = \"a\"\n[sidecar]\npath = \".\"\ncommand = \"python3\"\nargs = [\"server.py\"]\n";
         let config = Config::parse(text, &dir).unwrap();
-        let (spec, port, token) =
-            sidecar_spec(&config, Path::new("/data"), Path::new("/logs")).unwrap();
+        let (spec, port, token) = sidecar_spec(
+            &config,
+            sidecar_of(&config),
+            Path::new("/data"),
+            Path::new("/logs"),
+        )
+        .unwrap();
         let env: std::collections::HashMap<_, _> = spec.env.iter().cloned().collect();
         assert_eq!(env["APP_PORT"], port.to_string().as_str());
         assert_eq!(env["APP_DATA_DIR"], "/data");
@@ -252,8 +431,13 @@ mod tests {
         );
 
         let config = Config::parse(&format!("{text}[auth]\nenabled = false\n"), &dir).unwrap();
-        let (spec, _, token) =
-            sidecar_spec(&config, Path::new("/data"), Path::new("/logs")).unwrap();
+        let (spec, _, token) = sidecar_spec(
+            &config,
+            sidecar_of(&config),
+            Path::new("/data"),
+            Path::new("/logs"),
+        )
+        .unwrap();
         assert!(token.is_none());
         assert!(spec.env.iter().all(|(k, _)| k != "APP_TOKEN"));
         let _ = std::fs::remove_dir_all(&dir);

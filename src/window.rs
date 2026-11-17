@@ -3,7 +3,9 @@
 //! This is the one place that touches the windowing and webview crates.
 //! Every launch mode ends here with a URL and a [`WindowOptions`].
 
+use std::borrow::Cow;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use tao::dpi::{LogicalSize, PhysicalPosition};
@@ -11,6 +13,7 @@ use tao::event::{Event, StartCause, WindowEvent};
 use tao::event_loop::{ControlFlow, EventLoop, EventLoopBuilder, EventLoopProxy};
 use tao::window::{Theme, Window, WindowBuilder};
 use url::Url;
+use wry::http::{Request, Response};
 use wry::{NewWindowFeatures, NewWindowResponse, WebContext, WebView, WebViewBuilder};
 
 use crate::dialog::{self, ErrorReport};
@@ -38,6 +41,27 @@ pub struct WindowOptions {
     /// Where the webview keeps cookies, storage and caches. `None` uses the
     /// platform default.
     pub webview_data_dir: Option<PathBuf>,
+    /// A custom URL scheme answered in-process (static mode).
+    pub protocol: Option<CustomProtocol>,
+}
+
+/// Turns a request for a custom scheme into a response.
+pub type ProtocolHandler =
+    Arc<dyn Fn(&Request<Vec<u8>>) -> Response<Cow<'static, [u8]>> + Send + Sync>;
+
+/// Answers requests for one URL scheme without a network socket.
+#[derive(Clone)]
+pub struct CustomProtocol {
+    pub scheme: &'static str,
+    pub handler: ProtocolHandler,
+}
+
+impl std::fmt::Debug for CustomProtocol {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CustomProtocol")
+            .field("scheme", &self.scheme)
+            .finish_non_exhaustive()
+    }
 }
 
 /// Lets other threads reach the window while it is open.
@@ -268,16 +292,23 @@ fn build_webview(
     proxy: EventLoopProxy<UserEvent>,
 ) -> wry::Result<WebView> {
     let title_proxy = proxy.clone();
-    let app_origin = url.origin();
+    let app_url = url.clone();
 
-    let builder = WebViewBuilder::new_with_web_context(web_context)
+    let mut builder = WebViewBuilder::new_with_web_context(web_context);
+    if let Some(protocol) = &opts.protocol {
+        let handler = protocol.handler.clone();
+        builder = builder.with_custom_protocol(protocol.scheme.to_owned(), move |_id, request| {
+            handler(&request)
+        });
+    }
+    let builder = builder
         .with_url(url.as_str())
         .with_devtools(opts.devtools)
         .with_document_title_changed_handler(move |title| {
             let _ = title_proxy.send_event(UserEvent::TitleChanged(title));
         })
         .with_new_window_req_handler(move |target: String, _features: NewWindowFeatures| {
-            match new_window_action(&app_origin, &target) {
+            match new_window_action(&app_url, &target) {
                 NewWindowAction::LoadHere => {
                     let _ = proxy.send_event(UserEvent::Navigate(target));
                 }
@@ -318,11 +349,11 @@ enum NewWindowAction {
 
 /// Decide what to do with a request for a new window (`target="_blank"`,
 /// `window.open`). Porthole never opens a second window.
-fn new_window_action(app_origin: &url::Origin, target: &str) -> NewWindowAction {
+fn new_window_action(app_url: &Url, target: &str) -> NewWindowAction {
     let Ok(target_url) = Url::parse(target) else {
         return NewWindowAction::Ignore;
     };
-    if &target_url.origin() == app_origin {
+    if same_origin(app_url, &target_url) {
         return NewWindowAction::LoadHere;
     }
     match target_url.scheme() {
@@ -331,6 +362,15 @@ fn new_window_action(app_origin: &url::Origin, target: &str) -> NewWindowAction 
         // rather than hand them to the OS.
         _ => NewWindowAction::Ignore,
     }
+}
+
+/// Scheme, host and port match. Unlike [`Url::origin`], this also works
+/// for custom schemes such as `porthole://`, whose origins `url` treats as
+/// opaque (never equal to anything).
+fn same_origin(a: &Url, b: &Url) -> bool {
+    a.scheme() == b.scheme()
+        && a.host_str() == b.host_str()
+        && a.port_or_known_default() == b.port_or_known_default()
 }
 
 #[cfg(target_os = "macos")]
@@ -398,8 +438,25 @@ mod tests {
     use super::*;
 
     fn action(target: &str) -> NewWindowAction {
-        let origin = Url::parse("http://localhost:3000/").unwrap().origin();
-        new_window_action(&origin, target)
+        let app = Url::parse("http://localhost:3000/").unwrap();
+        new_window_action(&app, target)
+    }
+
+    #[test]
+    fn custom_scheme_counts_as_the_app() {
+        let app = Url::parse("porthole://localhost/").unwrap();
+        assert_eq!(
+            new_window_action(&app, "porthole://localhost/help.html"),
+            NewWindowAction::LoadHere
+        );
+        assert_eq!(
+            new_window_action(&app, "porthole://elsewhere/"),
+            NewWindowAction::Ignore
+        );
+        assert_eq!(
+            new_window_action(&app, "https://example.com/"),
+            NewWindowAction::OpenInBrowser
+        );
     }
 
     #[test]
