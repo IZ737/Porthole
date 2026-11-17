@@ -477,11 +477,13 @@ pub fn is_ready_status(status: u16) -> bool {
 fn http_status(stream: &mut TcpStream, addr: SocketAddr, path: &str) -> io::Result<u16> {
     stream.set_read_timeout(Some(Duration::from_secs(2)))?;
     stream.set_write_timeout(Some(Duration::from_secs(2)))?;
-    write!(
-        stream,
+    // One write: `write!` on a raw socket would send each piece of the
+    // format string as its own segment.
+    let request = format!(
         "GET {path} HTTP/1.1\r\nHost: {addr}\r\nUser-Agent: porthole\r\n\
          Accept: */*\r\nConnection: close\r\n\r\n"
-    )?;
+    );
+    stream.write_all(request.as_bytes())?;
     let mut line = String::new();
     BufReader::new(stream.take(1024)).read_line(&mut line)?;
     // "HTTP/1.1 200 OK"
@@ -888,16 +890,25 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let server = thread::spawn(move || {
-            for status in ["503 Service Unavailable", "401 Unauthorized"] {
+            let mut statuses = ["503 Service Unavailable", "401 Unauthorized"].into_iter();
+            let mut status = statuses.next();
+            while let Some(current) = status {
                 let (mut s, _) = listener.accept().unwrap();
                 let mut req = [0u8; 1024];
-                let n = s.read(&mut req).unwrap();
-                assert!(String::from_utf8_lossy(&req[..n]).starts_with("GET /healthz HTTP/1.1"));
-                write!(s, "HTTP/1.1 {status}\r\nContent-Length: 0\r\n\r\n").unwrap();
+                let n = s.read(&mut req).unwrap_or(0);
+                // Other tests run in parallel and probe ports they picked
+                // and released; one may land on this listener with a bare
+                // TCP connect. Only answer our own probe's request.
+                if !String::from_utf8_lossy(&req[..n]).starts_with("GET /healthz HTTP/1.1") {
+                    continue;
+                }
+                write!(s, "HTTP/1.1 {current}\r\nContent-Length: 0\r\n\r\n").unwrap();
+                status = statuses.next();
             }
         });
         assert!(probe(addr, Some("/healthz")).unwrap_err().contains("503"));
-        assert!(probe(addr, Some("/healthz")).is_ok());
+        let second = probe(addr, Some("/healthz"));
+        assert!(second.is_ok(), "{second:?}");
         server.join().unwrap();
     }
 
