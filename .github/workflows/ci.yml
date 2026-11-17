@@ -69,6 +69,23 @@ jobs:
             kill $pid
           '
 
+      # Starts the example sidecar app, checks the backend is up, then
+      # SIGKILLs the launcher and checks the backend went with it.
+      - name: Smoke test, sidecar (Linux)
+        if: runner.os == 'Linux'
+        env:
+          PORTHOLE_NO_DIALOGS: '1'
+        run: |
+          xvfb-run -a bash -c '
+            ./target/release/porthole run examples/hello-python/app.toml --console & pid=$!
+            sleep 5
+            kill -0 $pid || { echo "porthole exited early"; exit 1; }
+            pgrep -x -f "python3 server.py" || { echo "backend is not running"; exit 1; }
+            kill -9 $pid
+            sleep 2
+            if pgrep -x -f "python3 server.py"; then echo "backend outlived porthole"; exit 1; fi
+          '
+
       - uses: actions/upload-artifact@v4
         with:
           name: porthole-${{ runner.os }}-${{ runner.arch }}

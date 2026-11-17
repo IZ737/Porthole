@@ -1,6 +1,6 @@
 [package]
 name = "porthole-cli"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.90"
 description = "Turn a backend + localhost web UI into a single desktop app using the OS webview"
@@ -17,14 +17,36 @@ path = "src/main.rs"
 [dependencies]
 anyhow = "1.0"
 clap = { version = "4.6", features = ["derive"] }
+directories = "6.0"
+getrandom = "0.4"
+humantime = "2.4"
 open = "5.4"
+# Native error dialogs. On Linux, use GTK (already linked for the webview)
+# rather than the XDG portal, which would pull in an async runtime.
+rfd = { version = "0.17", default-features = false, features = ["gtk3"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
 tao = "0.37"
+toml = "1.2"
 url = "2.5"
 # `devtools` lets `run --devtools` open the inspector in release builds too.
 wry = { version = "0.57", features = ["devtools"] }
 
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [target.'cfg(target_os = "macos")'.dependencies]
 muda = { version = "0.21", default-features = false }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_Console",
+    "Win32_System_JobObjects",
+    "Win32_System_Threading",
+    "Win32_System_Diagnostics_ToolHelp",
+] }
 
 [profile.release]
 opt-level = "s"

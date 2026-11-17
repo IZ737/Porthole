@@ -3,19 +3,25 @@
 //! This is the one place that touches the windowing and webview crates.
 //! Every launch mode ends here with a URL and a [`WindowOptions`].
 
+use std::path::PathBuf;
+
 use anyhow::{Context, Result};
-use tao::dpi::LogicalSize;
+use tao::dpi::{LogicalSize, PhysicalPosition};
 use tao::event::{Event, StartCause, WindowEvent};
-use tao::event_loop::{ControlFlow, EventLoopBuilder, EventLoopProxy};
-use tao::window::{Window, WindowBuilder};
+use tao::event_loop::{ControlFlow, EventLoop, EventLoopBuilder, EventLoopProxy};
+use tao::window::{Theme, Window, WindowBuilder};
 use url::Url;
-use wry::{NewWindowFeatures, NewWindowResponse, WebView, WebViewBuilder};
+use wry::{NewWindowFeatures, NewWindowResponse, WebContext, WebView, WebViewBuilder};
+
+use crate::dialog::{self, ErrorReport};
+use crate::logs;
+use crate::window_state::{self, WindowState};
 
 /// Title shown until the page sets its own, when `--title` is not given.
 const DEFAULT_TITLE: &str = "Porthole";
 
-/// How the window looks. Later milestones fill this from `[window]` in
-/// `app.toml`; v0.1 fills it from command-line flags.
+/// How the window looks. Filled from `[window]` in `app.toml`, or from
+/// command-line flags for `run --url`.
 #[derive(Debug, Clone)]
 pub struct WindowOptions {
     /// Fixed title. `None` follows the page's `<title>`.
@@ -24,35 +30,81 @@ pub struct WindowOptions {
     pub height: u32,
     pub resizable: bool,
     pub devtools: bool,
+    /// `None` follows the system theme.
+    pub theme: Option<Theme>,
+    /// Where to remember size, position and maximised state; `None` to
+    /// always start at the default size.
+    pub state_file: Option<PathBuf>,
+    /// Where the webview keeps cookies, storage and caches. `None` uses the
+    /// platform default.
+    pub webview_data_dir: Option<PathBuf>,
+}
+
+/// Lets other threads reach the window while it is open.
+#[derive(Clone)]
+pub struct WindowHandle(EventLoopProxy<UserEvent>);
+
+impl WindowHandle {
+    /// Bring the window to the front (a second launch of a single-instance app).
+    pub fn focus(&self) {
+        let _ = self.0.send_event(UserEvent::Focus);
+    }
+
+    /// Show `report` in an error dialog, then close the app.
+    pub fn fail(&self, report: ErrorReport) {
+        let _ = self.0.send_event(UserEvent::Fatal(Box::new(report)));
+    }
+}
+
+/// Code the caller runs at points in the window's life.
+#[derive(Default)]
+pub struct Hooks {
+    /// Runs before the event loop starts, with a handle for other threads.
+    pub on_open: Option<Box<dyn FnOnce(WindowHandle)>>,
+    /// Runs once when the app is about to exit (window closed, or after a
+    /// fatal error), after the window is hidden. The process exits when it
+    /// returns.
+    pub on_exit: Option<Box<dyn FnOnce()>>,
 }
 
 /// Messages from webview callbacks (which may run off the main thread) to
 /// the event loop.
 #[derive(Debug)]
-enum UserEvent {
+pub enum UserEvent {
     /// The page's `<title>` changed.
     TitleChanged(String),
     /// A same-origin `target="_blank"` link or `window.open`: Porthole is
     /// single-window, so load it in the existing window.
     Navigate(String),
+    /// Bring the window to the front.
+    Focus,
+    /// Something the app depends on failed: show it and exit.
+    Fatal(Box<ErrorReport>),
 }
 
 /// Open the window on `url` and run the event loop until it is closed.
 ///
 /// The process exits when the window closes, so this only returns on a
 /// setup error.
-pub fn open(url: Url, opts: WindowOptions) -> Result<()> {
+pub fn open(url: Url, opts: WindowOptions, hooks: Hooks) -> Result<()> {
     let event_loop = EventLoopBuilder::<UserEvent>::with_user_event().build();
     let proxy = event_loop.create_proxy();
 
-    let window = WindowBuilder::new()
+    let saved = opts.state_file.as_deref().and_then(WindowState::load);
+    let mut builder = WindowBuilder::new()
         .with_title(opts.title.as_deref().unwrap_or(DEFAULT_TITLE))
         .with_inner_size(LogicalSize::new(opts.width, opts.height))
         .with_resizable(opts.resizable)
+        .with_theme(opts.theme);
+    if let Some(state) = &saved {
+        builder = restore(builder, &event_loop, state, opts.resizable);
+    }
+    let window = builder
         .build(&event_loop)
         .context("could not create the window")?;
 
-    let webview = build_webview(&window, &url, &opts, proxy)
+    let mut web_context = WebContext::new(opts.webview_data_dir.clone());
+    let webview = build_webview(&window, &url, &opts, &mut web_context, proxy)
         .context("could not create the webview (is the OS webview installed?)")?;
 
     // Without an Edit menu, Cmd+C / Cmd+V do nothing in WKWebView. The
@@ -60,9 +112,27 @@ pub fn open(url: Url, opts: WindowOptions) -> Result<()> {
     #[cfg(target_os = "macos")]
     let menu = macos_menu::build();
 
+    if let Some(on_open) = hooks.on_open {
+        on_open(WindowHandle(event_loop.create_proxy()));
+    }
+    let mut on_exit = hooks.on_exit;
+    let state_file = opts.state_file;
+    // The last size and position the window had while neither maximised
+    // nor minimised: what to restore next time.
+    let mut normal = match saved {
+        // Started maximised: the current size is the maximised one.
+        Some(s) if s.maximized => WindowState {
+            maximized: false,
+            ..s
+        },
+        _ => current_state(&window, saved.as_ref()),
+    };
+
     let follow_page_title = opts.title.is_none();
     event_loop.run(move |event, _target, control_flow| {
         *control_flow = ControlFlow::Wait;
+        // The webview needs its context for as long as it lives.
+        let _ = &web_context;
         match event {
             Event::NewEvents(StartCause::Init) =>
             {
@@ -81,14 +151,52 @@ pub fn open(url: Url, opts: WindowOptions) -> Result<()> {
             }
             Event::UserEvent(UserEvent::Navigate(target)) => {
                 if let Err(err) = webview.load_url(&target) {
-                    eprintln!("porthole: could not open {target}: {err}");
+                    logs::warning!("could not open {target}: {err}");
+                }
+            }
+            Event::UserEvent(UserEvent::Focus) => {
+                window.set_minimized(false);
+                window.set_visible(true);
+                window.set_focus();
+            }
+            Event::UserEvent(UserEvent::Fatal(report)) => {
+                window.set_visible(false);
+                if let Some(f) = on_exit.take() {
+                    f();
+                }
+                dialog::show_error(&report);
+                *control_flow = ControlFlow::Exit;
+            }
+            Event::WindowEvent {
+                event: WindowEvent::Moved(_) | WindowEvent::Resized(_),
+                ..
+            } => {
+                if !window.is_maximized() && !window.is_minimized() {
+                    normal = current_state(&window, Some(&normal));
                 }
             }
             Event::WindowEvent {
                 event: WindowEvent::CloseRequested,
                 ..
             } => {
-                // v0.2: stop the sidecar here before exiting.
+                if let Some(path) = &state_file {
+                    let state = WindowState {
+                        maximized: window.is_maximized(),
+                        ..normal
+                    };
+                    if let Err(err) = state.save(path) {
+                        logs::warning!(
+                            "could not save the window state to {}: {err}",
+                            path.display()
+                        );
+                    }
+                }
+                // Hide first so closing feels instant while the backend
+                // gets its grace period.
+                window.set_visible(false);
+                if let Some(f) = on_exit.take() {
+                    f();
+                }
                 *control_flow = ControlFlow::Exit;
             }
             _ => {}
@@ -96,16 +204,73 @@ pub fn open(url: Url, opts: WindowOptions) -> Result<()> {
     })
 }
 
+/// Apply saved state to the builder. A saved position that is no longer on
+/// any screen (a monitor was unplugged) is replaced by the primary
+/// monitor's centre.
+fn restore(
+    mut builder: WindowBuilder,
+    event_loop: &EventLoop<UserEvent>,
+    state: &WindowState,
+    resizable: bool,
+) -> WindowBuilder {
+    if resizable {
+        builder = builder.with_inner_size(LogicalSize::new(state.width, state.height));
+    }
+    builder = builder.with_maximized(state.maximized && resizable);
+
+    let (Some(x), Some(y)) = (state.x, state.y) else {
+        return builder;
+    };
+    let monitors: Vec<window_state::Rect> = event_loop
+        .available_monitors()
+        .map(|m| {
+            let (p, s) = (m.position(), m.size());
+            (p.x, p.y, s.width, s.height)
+        })
+        .collect();
+    let scale = event_loop
+        .primary_monitor()
+        .map_or(1.0, |m| m.scale_factor());
+    let physical: tao::dpi::PhysicalSize<u32> =
+        LogicalSize::new(state.width, state.height).to_physical(scale);
+    let size = (physical.width, physical.height);
+
+    if window_state::is_on_screen((x, y), size, &monitors) {
+        builder.with_position(PhysicalPosition::new(x, y))
+    } else if let Some(primary) = event_loop.primary_monitor() {
+        let (p, s) = (primary.position(), primary.size());
+        let (cx, cy) = window_state::centered(size, (p.x, p.y, s.width, s.height));
+        builder.with_position(PhysicalPosition::new(cx, cy))
+    } else {
+        builder
+    }
+}
+
+/// The window's current bounds. Platforms that can't report a position
+/// keep the previous one.
+fn current_state(window: &Window, previous: Option<&WindowState>) -> WindowState {
+    let size = window.inner_size().to_logical::<f64>(window.scale_factor());
+    let pos = window.outer_position().ok();
+    WindowState {
+        x: pos.map(|p| p.x).or(previous.and_then(|s| s.x)),
+        y: pos.map(|p| p.y).or(previous.and_then(|s| s.y)),
+        width: size.width,
+        height: size.height,
+        maximized: false,
+    }
+}
+
 fn build_webview(
     window: &Window,
     url: &Url,
     opts: &WindowOptions,
+    web_context: &mut WebContext,
     proxy: EventLoopProxy<UserEvent>,
 ) -> wry::Result<WebView> {
     let title_proxy = proxy.clone();
     let app_origin = url.origin();
 
-    let builder = WebViewBuilder::new()
+    let builder = WebViewBuilder::new_with_web_context(web_context)
         .with_url(url.as_str())
         .with_devtools(opts.devtools)
         .with_document_title_changed_handler(move |title| {
@@ -118,7 +283,7 @@ fn build_webview(
                 }
                 NewWindowAction::OpenInBrowser => {
                     if let Err(err) = open::that_detached(&target) {
-                        eprintln!("porthole: could not open {target} in the browser: {err}");
+                        logs::warning!("could not open {target} in the browser: {err}");
                     }
                 }
                 NewWindowAction::Ignore => {}
@@ -221,7 +386,7 @@ mod macos_menu {
         match built {
             Ok(()) => Some(menu),
             Err(err) => {
-                eprintln!("porthole: could not build the menu bar: {err}");
+                crate::logs::warning!("could not build the menu bar: {err}");
                 None
             }
         }

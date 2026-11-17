@@ -1,0 +1,22 @@
+# A minimal sidecar app: a Python standard-library web server that
+# implements Porthole's auth handshake.
+#
+#   porthole run examples/hello-python/app.toml --console
+
+[app]
+name = "Hello Python"
+id = "dev.porthole.hello-python"
+
+[window]
+width = 900
+height = 600
+
+[sidecar]
+path = "."
+command = "python3"
+args = ["server.py"]
+ready_path = "/healthz"
+
+# Windows installs Python as `python`.
+[sidecar.windows]
+command = "python"
