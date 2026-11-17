@@ -1,6 +1,7 @@
+use std::path::PathBuf;
 use std::time::Duration;
 
-use clap::{Args, Parser, Subcommand};
+use clap::{ArgGroup, Args, Parser, Subcommand};
 
 /// Turn a backend + localhost web UI into a desktop app using the OS webview.
 #[derive(Debug, Parser)]
@@ -14,34 +15,46 @@ pub struct Cli {
 pub enum Command {
     /// Open a window on a web app.
     ///
-    /// In v0.1 this only supports `--url`, which points the window at a
-    /// server you have already started (for example a Vite dev server).
+    /// `porthole run app.toml` starts the backend described in `app.toml`
+    /// and opens a window on it. `porthole run --url <URL>` opens a window
+    /// on a server you have already started (for example a Vite dev server).
     Run(RunArgs),
 }
 
 #[derive(Debug, Args)]
+#[command(group(ArgGroup::new("source").required(true).args(["config", "url"])))]
 pub struct RunArgs {
+    /// The app's `app.toml`: start its backend and open a window on it.
+    #[arg(value_name = "APP_TOML")]
+    pub config: Option<PathBuf>,
+
+    /// Stream the launcher and backend logs to this terminal as well as to
+    /// the log files (with `app.toml`).
+    #[arg(long, conflicts_with = "url")]
+    pub console: bool,
+
     /// URL of an already-running server, e.g. `http://localhost:3000`.
     ///
     /// `localhost:3000` and a bare port such as `3000` are accepted too and
     /// mean `http://localhost:<port>`.
     #[arg(long, value_name = "URL")]
-    pub url: String,
+    pub url: Option<String>,
 
-    /// Window title. Defaults to the page's `<title>`, updated as it changes.
-    #[arg(long)]
+    /// Window title. Defaults to the page's `<title>`, updated as it changes
+    /// (with `--url`; `app.toml` sets its own).
+    #[arg(long, conflicts_with = "config")]
     pub title: Option<String>,
 
-    /// Initial window width in logical pixels.
-    #[arg(long, default_value_t = 1200, value_parser = clap::value_parser!(u32).range(100..))]
+    /// Initial window width in logical pixels (with `--url`).
+    #[arg(long, default_value_t = 1200, value_parser = clap::value_parser!(u32).range(100..), conflicts_with = "config")]
     pub width: u32,
 
-    /// Initial window height in logical pixels.
-    #[arg(long, default_value_t = 800, value_parser = clap::value_parser!(u32).range(100..))]
+    /// Initial window height in logical pixels (with `--url`).
+    #[arg(long, default_value_t = 800, value_parser = clap::value_parser!(u32).range(100..), conflicts_with = "config")]
     pub height: u32,
 
-    /// Keep the window at its initial size.
-    #[arg(long)]
+    /// Keep the window at its initial size (with `--url`).
+    #[arg(long, conflicts_with = "config")]
     pub fixed_size: bool,
 
     /// Allow opening the web inspector (right-click > Inspect, or the
@@ -51,15 +64,21 @@ pub struct RunArgs {
 
     /// Allow URLs that are not on this machine (anything other than
     /// localhost or a loopback address).
-    #[arg(long)]
+    #[arg(long, conflicts_with = "config")]
     pub allow_remote: bool,
 
-    /// Seconds to wait for the server to accept connections before giving up.
-    #[arg(long, value_name = "SECS", default_value_t = 10.0)]
+    /// Seconds to wait for the server to accept connections before giving
+    /// up (with `--url`; `app.toml` uses `sidecar.ready_timeout_secs`).
+    #[arg(
+        long,
+        value_name = "SECS",
+        default_value_t = 10.0,
+        conflicts_with = "config"
+    )]
     pub wait: f64,
 
     /// Open the window straight away without checking that the server is up.
-    #[arg(long, conflicts_with = "wait")]
+    #[arg(long, conflicts_with_all = ["wait", "config"])]
     pub no_wait: bool,
 }
 
@@ -83,14 +102,39 @@ mod tests {
     fn run_parses_defaults() {
         let cli = Cli::try_parse_from(["porthole", "run", "--url", "3000"]).unwrap();
         let Command::Run(args) = cli.command;
-        assert_eq!(args.url, "3000");
+        assert_eq!(args.url.as_deref(), Some("3000"));
+        assert_eq!(args.config, None);
         assert_eq!((args.width, args.height), (1200, 800));
         assert!(!args.allow_remote && !args.devtools && !args.no_wait);
         assert_eq!(args.wait_timeout(), Duration::from_secs(10));
     }
 
     #[test]
-    fn run_requires_url() {
+    fn run_requires_url_or_config() {
         assert!(Cli::try_parse_from(["porthole", "run"]).is_err());
+    }
+
+    #[test]
+    fn run_with_config() {
+        let cli = Cli::try_parse_from(["porthole", "run", "app.toml", "--console", "--devtools"])
+            .unwrap();
+        let Command::Run(args) = cli.command;
+        assert_eq!(
+            args.config.as_deref(),
+            Some(std::path::Path::new("app.toml"))
+        );
+        assert!(args.console && args.devtools);
+    }
+
+    #[test]
+    fn config_and_url_flags_dont_mix() {
+        for bad in [
+            &["porthole", "run", "app.toml", "--url", "3000"][..],
+            &["porthole", "run", "app.toml", "--width", "900"],
+            &["porthole", "run", "app.toml", "--no-wait"],
+            &["porthole", "run", "--url", "3000", "--console"],
+        ] {
+            assert!(Cli::try_parse_from(bad).is_err(), "{bad:?}");
+        }
     }
 }
