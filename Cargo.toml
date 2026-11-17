@@ -1,0 +1,34 @@
+[package]
+name = "porthole-cli"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.90"
+description = "Turn a backend + localhost web UI into a single desktop app using the OS webview"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/IZ737/Porthole"
+readme = "README.md"
+keywords = ["webview", "desktop", "launcher", "sidecar", "gui"]
+categories = ["command-line-utilities", "gui"]
+
+[[bin]]
+name = "porthole"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0"
+clap = { version = "4.6", features = ["derive"] }
+open = "5.4"
+tao = "0.37"
+url = "2.5"
+# `devtools` lets `run --devtools` open the inspector in release builds too.
+wry = { version = "0.57", features = ["devtools"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+muda = { version = "0.21", default-features = false }
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
