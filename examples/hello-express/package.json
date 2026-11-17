@@ -1,0 +1,10 @@
+{
+  "name": "hello-express",
+  "private": true,
+  "description": "Porthole example: an Express backend behind porthole-auth",
+  "main": "server.js",
+  "dependencies": {
+    "express": "^5.1.0",
+    "porthole-auth": "file:../../auth-kit/node"
+  }
+}

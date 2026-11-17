@@ -1,0 +1,19 @@
+# A sidecar app with an Express backend, protected by the auth kit's
+# middleware (auth-kit/node).
+#
+#   cd examples/hello-express && npm install --install-links
+#   porthole run app.toml --console
+
+[app]
+name = "Hello Express"
+id = "dev.porthole.hello-express"
+
+[window]
+width = 900
+height = 600
+
+[sidecar]
+path = "."
+command = "node"
+args = ["server.js"]
+ready_path = "/"            # answers 401 without the cookie, which counts as ready
