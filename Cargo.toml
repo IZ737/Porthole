@@ -1,6 +1,6 @@
 [package]
 name = "porthole-cli"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 rust-version = "1.90"
 description = "Turn a backend + localhost web UI into a single desktop app using the OS webview"
@@ -20,17 +20,23 @@ clap = { version = "4.6", features = ["derive"] }
 directories = "6.0"
 getrandom = "0.4"
 humantime = "2.4"
+mime_guess = { version = "2.0", default-features = false }
 open = "5.4"
+percent-encoding = "2.3"
 # Native error dialogs. On Linux, use GTK (already linked for the webview)
 # rather than the XDG portal, which would pull in an async runtime.
 rfd = { version = "0.17", default-features = false, features = ["gtk3"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+sha2 = "0.11"
 tao = "0.37"
+tar = { version = "0.4", default-features = false }
 toml = "1.2"
 url = "2.5"
 # `devtools` lets `run --devtools` open the inspector in release builds too.
 wry = { version = "0.57", features = ["devtools"] }
+# `zstdmt` lets `pack` compress on all cores.
+zstd = { version = "0.14", default-features = false, features = ["zstdmt"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

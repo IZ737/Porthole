@@ -19,6 +19,63 @@ pub enum Command {
     /// and opens a window on it. `porthole run --url <URL>` opens a window
     /// on a server you have already started (for example a Vite dev server).
     Run(RunArgs),
+
+    /// Pack an app into a single executable.
+    ///
+    /// Copies this launcher and appends the app described in `app.toml`
+    /// (the sidecar or the static site, plus the config) as a compressed
+    /// payload. The result runs the app when started.
+    Pack(PackArgs),
+
+    /// Show what a packed executable contains.
+    Inspect(InspectArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct PackArgs {
+    /// The app's `app.toml`.
+    #[arg(value_name = "APP_TOML")]
+    pub config: PathBuf,
+
+    /// Where to write the executable. Defaults to `<app.name>` (plus `.exe`
+    /// on Windows) in the current folder.
+    #[arg(short, long, value_name = "FILE")]
+    pub output: Option<PathBuf>,
+
+    /// Allow the web inspector in the packed app. Off by default.
+    #[arg(long)]
+    pub devtools: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct InspectArgs {
+    /// A packed executable.
+    #[arg(value_name = "EXE")]
+    pub exe: PathBuf,
+}
+
+/// Flags a packed app accepts. Anything else on its command line is
+/// ignored (it belongs to the app, or to the OS).
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct PackedArgs {
+    /// Stream the logs to a terminal.
+    pub console: bool,
+    /// Unpack afresh instead of trusting the cache folder.
+    pub verify: bool,
+}
+
+impl PackedArgs {
+    pub fn parse(args: impl IntoIterator<Item = std::ffi::OsString>) -> Self {
+        let mut out = Self::default();
+        for arg in args {
+            match arg.to_str() {
+                Some("--console") => out.console = true,
+                Some("--verify") => out.verify = true,
+                _ => {}
+            }
+        }
+        out
+    }
 }
 
 #[derive(Debug, Args)]
@@ -101,12 +158,44 @@ mod tests {
     #[test]
     fn run_parses_defaults() {
         let cli = Cli::try_parse_from(["porthole", "run", "--url", "3000"]).unwrap();
-        let Command::Run(args) = cli.command;
+        let Command::Run(args) = cli.command else {
+            panic!("not run")
+        };
         assert_eq!(args.url.as_deref(), Some("3000"));
         assert_eq!(args.config, None);
         assert_eq!((args.width, args.height), (1200, 800));
         assert!(!args.allow_remote && !args.devtools && !args.no_wait);
         assert_eq!(args.wait_timeout(), Duration::from_secs(10));
+    }
+
+    #[test]
+    fn pack_and_inspect() {
+        let cli = Cli::try_parse_from(["porthole", "pack", "app.toml", "-o", "My.exe"]).unwrap();
+        let Command::Pack(args) = cli.command else {
+            panic!("not pack")
+        };
+        assert_eq!(args.output.as_deref(), Some(std::path::Path::new("My.exe")));
+        assert!(!args.devtools);
+        assert!(Cli::try_parse_from(["porthole", "pack"]).is_err());
+        assert!(matches!(
+            Cli::try_parse_from(["porthole", "inspect", "My.exe"])
+                .unwrap()
+                .command,
+            Command::Inspect(_)
+        ));
+    }
+
+    #[test]
+    fn packed_args() {
+        let args = |a: &[&str]| PackedArgs::parse(a.iter().map(std::ffi::OsString::from));
+        assert_eq!(args(&[]), PackedArgs::default());
+        assert_eq!(
+            args(&["--console", "file.txt", "--verify"]),
+            PackedArgs {
+                console: true,
+                verify: true
+            }
+        );
     }
 
     #[test]
@@ -118,7 +207,9 @@ mod tests {
     fn run_with_config() {
         let cli = Cli::try_parse_from(["porthole", "run", "app.toml", "--console", "--devtools"])
             .unwrap();
-        let Command::Run(args) = cli.command;
+        let Command::Run(args) = cli.command else {
+            panic!("not run")
+        };
         assert_eq!(
             args.config.as_deref(),
             Some(std::path::Path::new("app.toml"))

@@ -2,7 +2,7 @@
 //!
 //! Parsing is strict (unknown keys are errors) so typos fail loudly instead
 //! of being silently ignored. Keys that belong to later milestones (title
-//! bar modes, `[static]`) are accepted where the format is final, and
+//! bar modes) are accepted where the format is final, and
 //! [`Config::warnings`] says what this version ignores.
 
 use std::path::{Path, PathBuf};
@@ -16,8 +16,15 @@ use serde::Deserialize;
 pub struct Config {
     pub app: AppSection,
     pub window: WindowSection,
-    pub sidecar: SidecarSection,
+    pub mode: Mode,
     pub auth: AuthSection,
+}
+
+/// How the app is served: exactly one of `[sidecar]` and `[static]`.
+#[derive(Debug, Clone)]
+pub enum Mode {
+    Sidecar(SidecarSection),
+    Static(StaticSection),
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -27,8 +34,7 @@ pub struct AppSection {
     /// Reverse-DNS style id, e.g. `com.example.myapp`. Names the data folder
     /// and the single-instance lock.
     pub id: String,
-    /// Window and app icon. Bundled by `pack` (v0.3); not used by `run` yet.
-    #[allow(dead_code)]
+    /// App icon, bundled by `pack`. Not shown by the window yet (v0.5).
     pub icon: Option<String>,
 }
 
@@ -91,6 +97,35 @@ pub struct SidecarSection {
     pub shutdown_grace: Duration,
 }
 
+/// `[static]`: a folder of HTML/CSS/JS served by Porthole itself.
+#[derive(Debug, Clone)]
+pub struct StaticSection {
+    /// The site's folder, resolved against `base_dir`.
+    pub root: PathBuf,
+    /// Serve `index.html` for unknown paths without a file extension.
+    pub spa_fallback: bool,
+    /// Replaces the default Content-Security-Policy.
+    pub csp: Option<String>,
+    /// Sites larger than this are served from the extract-once cache
+    /// instead of memory (packed apps only).
+    pub in_memory_limit: u64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawStatic {
+    root: PathBuf,
+    #[serde(default)]
+    spa_fallback: bool,
+    csp: Option<String>,
+    #[serde(default = "default_in_memory_limit_mb")]
+    in_memory_limit_mb: f64,
+}
+
+fn default_in_memory_limit_mb() -> f64 {
+    64.0
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct AuthSection {
@@ -145,7 +180,7 @@ struct RawConfig {
     window: WindowSection,
     sidecar: Option<RawSidecar>,
     #[serde(rename = "static")]
-    static_: Option<toml::Table>,
+    static_: Option<RawStatic>,
     #[serde(default)]
     auth: AuthSection,
 }
@@ -181,46 +216,17 @@ impl Config {
             bail!("`window.width` and `window.height` must be at least 100");
         }
 
-        let sidecar = match (raw.sidecar, raw.static_) {
+        let mode = match (raw.sidecar, raw.static_) {
             (Some(_), Some(_)) => bail!("use either [sidecar] or [static], not both"),
-            (None, Some(_)) => bail!(
-                "[static] mode is not supported yet (it arrives in Porthole v0.3); \
-                 use [sidecar] for now"
-            ),
-            (None, None) => bail!("missing [sidecar] section"),
-            (Some(s), None) => s,
+            (None, None) => bail!("missing [sidecar] or [static] section"),
+            (Some(s), None) => Mode::Sidecar(parse_sidecar(s, base_dir)?),
+            (None, Some(s)) => Mode::Static(parse_static(s, base_dir)?),
         };
-
-        let os = match std::env::consts::OS {
-            "windows" => sidecar.windows,
-            "macos" => sidecar.macos,
-            "linux" => sidecar.linux,
-            _ => None,
-        };
-        let (os_command, os_args) = os.map_or((None, None), |o| (o.command, o.args));
-        let command = os_command.or(sidecar.command);
-        let args = os_args.or(sidecar.args).unwrap_or_default();
-
-        if command.as_deref().is_some_and(|c| c.trim().is_empty()) {
-            bail!("`sidecar.command` must not be empty");
-        }
-        if let Some(p) = &sidecar.ready_path
-            && !p.starts_with('/')
-        {
-            bail!("`sidecar.ready_path` must start with `/`, e.g. \"/healthz\"");
-        }
 
         Ok(Config {
             app: raw.app,
             window: raw.window,
-            sidecar: SidecarSection {
-                path: base_dir.join(&sidecar.path),
-                command,
-                args,
-                ready_path: sidecar.ready_path,
-                ready_timeout: secs("sidecar.ready_timeout_secs", sidecar.ready_timeout_secs)?,
-                shutdown_grace: secs("sidecar.shutdown_grace_secs", sidecar.shutdown_grace_secs)?,
-            },
+            mode,
             auth: raw.auth,
         })
     }
@@ -245,6 +251,54 @@ impl Config {
         }
         out
     }
+}
+
+fn parse_static(raw: RawStatic, base_dir: &Path) -> Result<StaticSection> {
+    let mb = raw.in_memory_limit_mb;
+    if !mb.is_finite() || mb < 0.0 {
+        bail!("`static.in_memory_limit_mb` must be a non-negative number");
+    }
+    if let Some(csp) = &raw.csp
+        && (csp.trim().is_empty() || csp.contains(['\r', '\n']))
+    {
+        bail!("`static.csp` must be a single non-empty line");
+    }
+    Ok(StaticSection {
+        root: base_dir.join(&raw.root),
+        spa_fallback: raw.spa_fallback,
+        csp: raw.csp,
+        in_memory_limit: (mb * 1024.0 * 1024.0) as u64,
+    })
+}
+
+fn parse_sidecar(sidecar: RawSidecar, base_dir: &Path) -> Result<SidecarSection> {
+    let os = match std::env::consts::OS {
+        "windows" => sidecar.windows,
+        "macos" => sidecar.macos,
+        "linux" => sidecar.linux,
+        _ => None,
+    };
+    let (os_command, os_args) = os.map_or((None, None), |o| (o.command, o.args));
+    let command = os_command.or(sidecar.command);
+    let args = os_args.or(sidecar.args).unwrap_or_default();
+
+    if command.as_deref().is_some_and(|c| c.trim().is_empty()) {
+        bail!("`sidecar.command` must not be empty");
+    }
+    if let Some(p) = &sidecar.ready_path
+        && !p.starts_with('/')
+    {
+        bail!("`sidecar.ready_path` must start with `/`, e.g. \"/healthz\"");
+    }
+
+    Ok(SidecarSection {
+        path: base_dir.join(&sidecar.path),
+        command,
+        args,
+        ready_path: sidecar.ready_path,
+        ready_timeout: secs("sidecar.ready_timeout_secs", sidecar.ready_timeout_secs)?,
+        shutdown_grace: secs("sidecar.shutdown_grace_secs", sidecar.shutdown_grace_secs)?,
+    })
 }
 
 fn secs(key: &str, value: f64) -> Result<Duration> {
@@ -315,6 +369,55 @@ mod tests {
         Config::parse(text, Path::new("/base"))
     }
 
+    impl Config {
+        fn sidecar(&self) -> &SidecarSection {
+            match &self.mode {
+                Mode::Sidecar(s) => s,
+                Mode::Static(_) => panic!("not a sidecar app"),
+            }
+        }
+    }
+
+    #[test]
+    fn parses_static() {
+        let c = parse(
+            r#"
+            [app]
+            name = "Site"
+            id = "site"
+            [static]
+            root = "web/"
+            "#,
+        )
+        .unwrap();
+        let Mode::Static(s) = &c.mode else {
+            panic!("not static")
+        };
+        assert_eq!(s.root, Path::new("/base").join("web/"));
+        assert!(!s.spa_fallback && s.csp.is_none());
+        assert_eq!(s.in_memory_limit, 64 * 1024 * 1024);
+
+        let c = parse(
+            r#"
+            [app]
+            name = "Site"
+            id = "site"
+            [static]
+            root = "web"
+            spa_fallback = true
+            csp = "default-src 'self'"
+            in_memory_limit_mb = 0.5
+            "#,
+        )
+        .unwrap();
+        let Mode::Static(s) = &c.mode else {
+            panic!("not static")
+        };
+        assert!(s.spa_fallback);
+        assert_eq!(s.csp.as_deref(), Some("default-src 'self'"));
+        assert_eq!(s.in_memory_limit, 512 * 1024);
+    }
+
     #[test]
     fn parses_full_example() {
         let c = parse(FULL).unwrap();
@@ -323,10 +426,10 @@ mod tests {
         assert_eq!((c.window.width, c.window.height), (1000, 700));
         assert!(!c.window.resizable && !c.window.single_instance && !c.window.remember_window);
         assert_eq!(c.window.theme, Theme::Dark);
-        assert_eq!(c.sidecar.path, Path::new("/base").join("dist/"));
-        assert_eq!(c.sidecar.ready_path.as_deref(), Some("/healthz"));
-        assert_eq!(c.sidecar.ready_timeout, Duration::from_secs(5));
-        assert_eq!(c.sidecar.shutdown_grace, Duration::from_millis(1500));
+        assert_eq!(c.sidecar().path, Path::new("/base").join("dist/"));
+        assert_eq!(c.sidecar().ready_path.as_deref(), Some("/healthz"));
+        assert_eq!(c.sidecar().ready_timeout, Duration::from_secs(5));
+        assert_eq!(c.sidecar().shutdown_grace, Duration::from_millis(1500));
         assert!(!c.auth.enabled);
         assert!(c.warnings().is_empty());
 
@@ -338,8 +441,8 @@ mod tests {
             "linux" => ("server-linux", &["--linux"]),
             _ => ("server", &["--mode", "desktop"]),
         };
-        assert_eq!(c.sidecar.command.as_deref(), Some(cmd));
-        assert_eq!(c.sidecar.args, args);
+        assert_eq!(c.sidecar().command.as_deref(), Some(cmd));
+        assert_eq!(c.sidecar().args, args);
     }
 
     #[test]
@@ -359,10 +462,10 @@ mod tests {
         assert!(c.window.resizable && c.window.single_instance && c.window.remember_window);
         assert_eq!(c.window.theme, Theme::System);
         assert!(c.auth.enabled);
-        assert_eq!(c.sidecar.command, None);
-        assert!(c.sidecar.args.is_empty());
-        assert_eq!(c.sidecar.ready_timeout, Duration::from_secs(15));
-        assert_eq!(c.sidecar.shutdown_grace, Duration::from_secs(3));
+        assert_eq!(c.sidecar().command, None);
+        assert!(c.sidecar().args.is_empty());
+        assert_eq!(c.sidecar().ready_timeout, Duration::from_secs(15));
+        assert_eq!(c.sidecar().shutdown_grace, Duration::from_secs(3));
     }
 
     #[test]
@@ -370,7 +473,11 @@ mod tests {
         let base = "[app]\nname = \"A\"\nid = \"a\"\n";
         let cases = [
             ("", "missing [sidecar]"),
-            ("[static]\nroot = \"web/\"\n", "v0.3"),
+            (
+                "[static]\nroot = \"web/\"\nin_memory_limit_mb = -1\n",
+                "non-negative",
+            ),
+            ("[static]\nroot = \"web/\"\nspa = true\n", "spa"),
             (
                 "[static]\nroot = \"web/\"\n[sidecar]\npath = \"x\"\n",
                 "not both",
