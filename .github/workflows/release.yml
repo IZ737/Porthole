@@ -108,4 +108,4 @@ jobs:
         run: |
           gh release create "$GITHUB_REF_NAME" dist/* \
             --title "Porthole ${GITHUB_REF_NAME#v}" \
-            --notes "Launchers for \`porthole pack --target\`. Install the CLI with \`cargo install porthole-cli\`, or use the launcher for your platform directly as \`porthole\`."
+            --notes "Install the CLI on macOS or Linux with \`curl -fsSL https://raw.githubusercontent.com/IZ737/Porthole/main/install.sh | sh\`, or on Windows with \`irm https://raw.githubusercontent.com/IZ737/Porthole/main/install.ps1 | iex\`. The same files are the launchers that \`porthole pack --target\` downloads."

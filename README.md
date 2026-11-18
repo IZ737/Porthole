@@ -14,6 +14,52 @@ shipping a browser.
 > packed format is [frozen for 1.x](FORMAT.md); see
 > [Stability](#stability) for what else 1.x promises.
 
+## Install
+
+macOS and Linux:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/IZ737/Porthole/main/install.sh | sh
+```
+
+Windows (PowerShell):
+
+```powershell
+irm https://raw.githubusercontent.com/IZ737/Porthole/main/install.ps1 | iex
+```
+
+Both scripts download the `porthole` binary for your platform from the
+latest [GitHub release](https://github.com/IZ737/Porthole/releases), check
+it against the release's `SHA256SUMS`, and install it without admin
+rights: to `~/.local/bin` on macOS and Linux (the script tells you if that
+is not on your `PATH`), or to `%LOCALAPPDATA%\Programs\porthole` on
+Windows, which it adds to your user `PATH`. Run the same line again to
+update. Releases have builds for Windows x64 (which also runs on Windows 11
+on Arm), macOS on Apple silicon and Intel, and Linux x64; on Linux you also
+need the [WebKitGTK runtime](#building), and the script says so if it is
+missing.
+
+The scripts read a few optional environment variables:
+
+| Variable | Meaning |
+| --- | --- |
+| `PORTHOLE_VERSION` | Install this release, such as `1.0.0`, instead of the latest |
+| `PORTHOLE_INSTALL_DIR` | Install to this folder instead |
+| `PORTHOLE_BASE_URL` | Download from a mirror of the releases page (same layout) |
+| `PORTHOLE_NO_MODIFY_PATH` | Windows: set to `1` to leave your `PATH` alone |
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/IZ737/Porthole/main/install.sh | PORTHOLE_VERSION=1.0.0 sh
+```
+
+```powershell
+$env:PORTHOLE_VERSION = '1.0.0'; irm https://raw.githubusercontent.com/IZ737/Porthole/main/install.ps1 | iex
+```
+
+To uninstall, delete the binary (and, on Windows, its folder from your
+user `PATH`). To build from source instead, see [Building](#building), or
+run `cargo install --git https://github.com/IZ737/Porthole porthole-cli`.
+
 ## Pack an app into one executable
 
 ```sh
@@ -557,7 +603,8 @@ macOS bundle after codesigning it.
 Pushing a tag such as `v1.0.0` (matching `version` in `Cargo.toml`) runs
 the release workflow: it builds the launchers for the four targets in
 [Cross-packing](#cross-packing), and publishes them on a GitHub release with
-`SHA256SUMS`. That is where `pack --target` downloads from.
+`SHA256SUMS`. That is where `pack --target` and the [install
+scripts](#install) download from.
 
 ## Roadmap
 

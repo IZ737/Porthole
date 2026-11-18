@@ -189,6 +189,38 @@ jobs:
 
   # The auth kit's middlewares, on every OS: their own tests, then the
   # shared conformance checks against them and the three example backends.
+  install-scripts:
+    name: Install scripts (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Lint install.sh
+        if: runner.os == 'Linux'
+        run: shellcheck -s sh install.sh ci/test-install.sh
+
+      # Against a fake release on localhost, so this runs before any tag.
+      - name: Test install.sh
+        if: runner.os != 'Windows'
+        run: |
+          ci/test-install.sh sh
+          ci/test-install.sh bash
+          if command -v dash >/dev/null; then ci/test-install.sh dash; fi
+
+      - name: Test install.ps1 (PowerShell 7)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./ci/test-install.ps1
+
+      - name: Test install.ps1 (Windows PowerShell 5.1)
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: ./ci/test-install.ps1
+
   auth-kit:
     name: Auth kit (${{ matrix.os }})
     strategy:

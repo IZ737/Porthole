@@ -3,6 +3,13 @@
 Porthole follows [semantic versioning](https://semver.org) from 1.0. The
 README's [Stability](README.md#stability) section says what that covers.
 
+## Unreleased
+
+- **One-line install.** `install.sh` (macOS and Linux, `curl … | sh`) and
+  `install.ps1` (Windows, `irm … | iex`) download the latest release's
+  binary, check it against `SHA256SUMS`, and put it on `PATH` without
+  admin rights. See [Install](README.md#install).
+
 ## 1.0.0
 
 The packed format is frozen: every 1.x launcher runs every app packed by
