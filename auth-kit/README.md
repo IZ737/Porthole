@@ -34,10 +34,11 @@ See [`python/`](python) and [`examples/hello-fastapi`](../examples/hello-fastapi
 
 ## Other languages
 
-Go and ASP.NET helpers are planned. Until then, follow the
-[spec](../README.md#auth-handshake) (it is about 30 lines in any
-language; [`examples/hello-python`](../examples/hello-python) does it
-with the standard library) and check your server with:
+Follow the [spec](../README.md#auth-handshake): it is about 30 lines in
+any language. [`examples/hello-go`](../examples/hello-go) has a Go
+`net/http` middleware (`guard` in `main.go`) to copy, and
+[`examples/hello-python`](../examples/hello-python) does it with Python's
+standard library. Check your server with:
 
 ```sh
 python3 auth-kit/conformance.py -- ./my-server --some-flag

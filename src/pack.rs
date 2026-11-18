@@ -1,7 +1,10 @@
 //! `porthole pack` and `porthole inspect`.
 //!
-//! `pack` copies this launcher, appends the app as a zstd-compressed tar
+//! `pack` copies a launcher (this one, or a prebuilt one for another
+//! platform with `--target`), appends the app as a zstd-compressed tar
 //! payload, and ends the file with the footer described in [`payload`].
+//! With `--macos-app` it writes a `.app` bundle instead, with the payload
+//! in `Contents/Resources` (see [`crate::macos_app`]).
 
 use std::fs::{self, File};
 use std::io::{self, BufWriter, Write};
@@ -12,6 +15,9 @@ use anyhow::{Context, Result, bail};
 
 use crate::cache;
 use crate::config::{Config, Mode};
+use crate::exe;
+use crate::launcher;
+use crate::macos_app;
 use crate::payload::{self, APP_DIR, APP_TOML, FOOTER_LEN, Footer, PACK_TOML, PackInfo, Payload};
 use crate::sidecar;
 
@@ -19,9 +25,16 @@ use crate::sidecar;
 /// only runs once.
 const ZSTD_LEVEL: i32 = 19;
 
+#[derive(Default)]
 pub struct PackOptions {
     pub output: Option<PathBuf>,
     pub devtools: bool,
+    /// Pack for another platform (a target triple).
+    pub target: Option<String>,
+    /// Use this launcher binary instead of this one or a downloaded one.
+    pub launcher: Option<PathBuf>,
+    /// Write a macOS `.app` bundle.
+    pub macos_app: bool,
 }
 
 /// One file or folder to put in the payload.
@@ -41,17 +54,17 @@ enum Kind {
 
 pub fn pack(config_path: &Path, opts: PackOptions) -> Result<()> {
     let started = Instant::now();
-    let exe = std::env::current_exe().context("could not find the porthole executable")?;
-    let packed = pack_with(config_path, opts, &exe)?;
+    let launcher = launcher::resolve(opts.target.as_deref(), opts.launcher.as_deref())?;
+    let packed = pack_with(config_path, opts, &launcher)?;
     let footer = &packed.footer;
-    let total = footer.payload_offset + footer.payload_len + FOOTER_LEN as u64;
     println!(
-        "Packed {} ({}) into {} in {:.1}s",
+        "Packed {} ({}) for {} into {} in {:.1}s",
         packed.config.app.name,
         match packed.config.mode {
             Mode::Sidecar(_) => "sidecar",
             Mode::Static(_) => "static",
         },
+        packed.kind.describe(),
         packed.output.display(),
         started.elapsed().as_secs_f64()
     );
@@ -60,9 +73,30 @@ pub fn pack(config_path: &Path, opts: PackOptions) -> Result<()> {
         packed.info.files,
         size(packed.info.unpacked_bytes),
         size(footer.payload_len),
-        size(total)
+        size(packed.total_bytes)
     );
     println!("  sha256 {}", footer.sha256_hex());
+    if let Mode::Sidecar(sc) = &packed.config.mode
+        && packed.kind.os() != std::env::consts::OS
+    {
+        println!(
+            "  note: the sidecar ({}) must be built for {} too",
+            sc.command.as_deref().unwrap_or("app/"),
+            packed.kind.os()
+        );
+    }
+    match packed.kind.os() {
+        "windows" => {
+            println!("  sign it with signtool now if you distribute it (see README, Signing)")
+        }
+        "macos" if packed.bundle => println!(
+            "  sign and notarize the bundle before you distribute it (see README, Signing)"
+        ),
+        "macos" => println!(
+            "  to sign it for distribution, pack with --macos-app instead: codesign can't sign this file"
+        ),
+        _ => {}
+    }
     Ok(())
 }
 
@@ -71,6 +105,11 @@ pub struct Packed {
     pub footer: Footer,
     pub config: Config,
     pub info: PackInfo,
+    /// The launcher's platform.
+    pub kind: exe::Kind,
+    /// A `.app` bundle rather than one file.
+    pub bundle: bool,
+    pub total_bytes: u64,
 }
 
 /// Pack `config_path` onto the launcher at `launcher`.
@@ -79,14 +118,42 @@ pub fn pack_with(config_path: &Path, opts: PackOptions, launcher: &Path) -> Resu
     let text = fs::read_to_string(config_path)?;
     let base_dir = config_path.parent().unwrap_or(Path::new("."));
 
+    let kind = exe::kind(launcher)?;
+    if let Some(target) = &opts.target
+        && !kind.runs_on(target)
+    {
+        bail!(
+            "{} is a {} launcher, not one for {target}",
+            launcher.display(),
+            kind.describe()
+        );
+    }
+    if opts.macos_app && kind.os() != "macos" {
+        bail!(
+            "--macos-app needs a macOS launcher, and {} is {}; add --target aarch64-apple-darwin \
+             (or x86_64-apple-darwin)",
+            launcher.display(),
+            kind.describe()
+        );
+    }
+
     let output = match opts.output {
         Some(o) => o,
         None => PathBuf::from(format!(
             "{}{}",
             config.app.name,
-            std::env::consts::EXE_SUFFIX
+            if opts.macos_app {
+                ".app"
+            } else if kind.os() == "windows" {
+                ".exe"
+            } else {
+                ""
+            }
         )),
     };
+    if opts.macos_app && output.extension().is_none_or(|e| e != "app") {
+        bail!("with --macos-app, `-o` must end in `.app`");
+    }
     let output = std::path::absolute(&output)?;
     let tmp_output = output.with_file_name(format!(
         ".{}.porthole-tmp",
@@ -99,8 +166,13 @@ pub fn pack_with(config_path: &Path, opts: PackOptions, launcher: &Path) -> Resu
     // What goes under `app/`, and what `app.toml` will say about it.
     let (source, rewritten_key, rewritten_value) = match &config.mode {
         Mode::Sidecar(s) => {
-            // Fails early on a missing command, as `run` would.
-            sidecar::resolve_program(&s.path, s.command.as_deref())?;
+            // Fails early on a missing command, as `run` would. (Only for
+            // this platform: a cross-packed sidecar is the user's call.)
+            if opts.target.is_none() {
+                sidecar::resolve_program(&s.path, s.command.as_deref())?;
+            } else if !s.path.exists() {
+                bail!("`sidecar.path` {} does not exist", s.path.display());
+            }
             let value = if s.path.is_dir() {
                 APP_DIR.to_owned()
             } else {
@@ -197,62 +269,88 @@ pub fn pack_with(config_path: &Path, opts: PackOptions, launcher: &Path) -> Resu
     };
     let pack_toml = toml::to_string(&info)?;
 
-    // The launcher, minus any payload it carries itself.
-    let launcher_len = match payload::read_footer(launcher)? {
+    // The launcher, minus any payload it carries itself, and minus a
+    // signature (which would not cover the packed file anyway).
+    let launcher_file_len = fs::metadata(launcher)?.len();
+    let mut launcher_len = match payload::read_footer(launcher)? {
         Some(f) => f.payload_offset,
-        None => fs::metadata(launcher)?.len(),
+        None => launcher_file_len,
+    };
+    let pe = exe::pe_header(&mut File::open(launcher)?)?;
+    if let Some(end) = pe.as_ref().and_then(|h| h.signed_end(launcher_file_len)) {
+        launcher_len = launcher_len.min(end);
+    }
+    let icon = match &icon {
+        Some((name, path)) => Some((name.clone(), fs::read(path)?)),
+        None => None,
+    };
+    let contents = Contents {
+        app_toml: &app_toml,
+        pack_toml: &pack_toml,
+        icon: icon.as_ref(),
+        items: &items,
     };
 
-    let result = (|| -> Result<Footer> {
-        let mut out = BufWriter::new(File::create(&tmp_output)?);
-        io::copy(
-            &mut io::Read::take(File::open(launcher)?, launcher_len),
-            &mut out,
+    let result = if opts.macos_app {
+        macos_app::write(
+            &tmp_output,
+            &config,
+            launcher,
+            launcher_len,
+            icon.as_ref().map(|(_, bytes)| bytes.as_slice()),
+            |out| write_payload(out, &contents),
         )
-        .context("could not copy the launcher")?;
-
-        let mut hashed = payload::HashingWriter::new(out);
-        {
-            let mut encoder = zstd::Encoder::new(&mut hashed, ZSTD_LEVEL)?;
-            let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
-            // Multithreading is a nice-to-have; ignore it if unsupported.
-            let _ = encoder.multithread(threads as u32);
-            let mut tar = tar::Builder::new(encoder);
-            tar.mode(tar::HeaderMode::Deterministic);
-            append_bytes(&mut tar, APP_TOML, app_toml.as_bytes())?;
-            append_bytes(&mut tar, PACK_TOML, pack_toml.as_bytes())?;
-            if let Some((name, path)) = &icon {
-                append_bytes(&mut tar, name, &fs::read(path)?)?;
+    } else {
+        (|| -> Result<(Footer, u64)> {
+            let mut out = BufWriter::new(File::create(&tmp_output)?);
+            io::copy(
+                &mut io::Read::take(File::open(launcher)?, launcher_len),
+                &mut out,
+            )
+            .context("could not copy the launcher")?;
+            if let Some(header) = &pe {
+                out.flush()?;
+                exe::prepare_windows_copy(out.get_mut(), header)?;
             }
-            for item in &items {
-                append(&mut tar, item)
-                    .with_context(|| format!("could not add {}", item.source.display()))?;
-            }
-            tar.into_inner()?.finish()?;
-        }
-        let (mut out, payload_len, sha256) = hashed.finish();
-        let footer = Footer {
-            version: payload::VERSION,
-            payload_offset: launcher_len,
-            payload_len,
-            sha256,
-        };
-        out.write_all(&footer.encode())?;
-        out.into_inner().map_err(|e| e.into_error())?.sync_all()?;
-        Ok(footer)
-    })();
-    let footer = match result {
+            let (mut out, payload_len, sha256) = write_payload(out, &contents)?;
+            let footer = Footer {
+                version: payload::VERSION,
+                payload_offset: launcher_len,
+                payload_len,
+                sha256,
+            };
+            out.write_all(&footer.encode())?;
+            out.into_inner().map_err(|e| e.into_error())?.sync_all()?;
+            Ok((footer, launcher_len + payload_len + FOOTER_LEN as u64))
+        })()
+    };
+    let (footer, total_bytes) = match result {
         Ok(f) => f,
         Err(err) => {
             let _ = fs::remove_file(&tmp_output);
+            let _ = fs::remove_dir_all(&tmp_output);
             return Err(err.context(format!("could not write {}", tmp_output.display())));
         }
     };
 
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&tmp_output, fs::Permissions::from_mode(0o755))?;
+    if opts.macos_app {
+        if output.exists() {
+            if !output.join("Contents/Info.plist").is_file() {
+                let _ = fs::remove_dir_all(&tmp_output);
+                bail!(
+                    "{} exists and is not an app bundle; not replacing it",
+                    output.display()
+                );
+            }
+            fs::remove_dir_all(&output)
+                .with_context(|| format!("could not replace {}", output.display()))?;
+        }
+    } else {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&tmp_output, fs::Permissions::from_mode(0o755))?;
+        }
     }
     fs::rename(&tmp_output, &output)
         .with_context(|| format!("could not write {}", output.display()))?;
@@ -262,24 +360,90 @@ pub fn pack_with(config_path: &Path, opts: PackOptions, launcher: &Path) -> Resu
         footer,
         config,
         info,
+        kind,
+        bundle: opts.macos_app,
+        total_bytes,
     })
 }
 
+/// Everything that goes into the payload.
+struct Contents<'a> {
+    app_toml: &'a str,
+    pack_toml: &'a str,
+    icon: Option<&'a (String, Vec<u8>)>,
+    items: &'a [Item],
+}
+
+/// Write the compressed payload to `out`. Returns `out`, the payload's
+/// length and its sha256.
+fn write_payload<W: Write>(out: W, c: &Contents) -> Result<(W, u64, [u8; 32])> {
+    let mut hashed = payload::HashingWriter::new(out);
+    {
+        let mut encoder = zstd::Encoder::new(&mut hashed, ZSTD_LEVEL)?;
+        let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
+        // Multithreading is a nice-to-have; ignore it if unsupported.
+        let _ = encoder.multithread(threads as u32);
+        let mut tar = tar::Builder::new(encoder);
+        tar.mode(tar::HeaderMode::Deterministic);
+        append_bytes(&mut tar, APP_TOML, c.app_toml.as_bytes())?;
+        append_bytes(&mut tar, PACK_TOML, c.pack_toml.as_bytes())?;
+        if let Some((name, bytes)) = c.icon {
+            append_bytes(&mut tar, name, bytes)?;
+        }
+        for item in c.items {
+            append(&mut tar, item)
+                .with_context(|| format!("could not add {}", item.source.display()))?;
+        }
+        tar.into_inner()?.finish()?;
+    }
+    Ok(hashed.finish())
+}
+
 /// `porthole inspect <exe>`: print the footer and the payload's contents.
-pub fn inspect(exe: &Path) -> Result<()> {
+pub fn inspect(path: &Path) -> Result<()> {
+    // A `.app` bundle: the payload and the launcher are separate files.
+    let (exe, launcher) = if path.is_dir() {
+        let payload = macos_app::payload_in_bundle(path).with_context(|| {
+            format!(
+                "{} is a folder, but not an app bundle made by `pack --macos-app`",
+                path.display()
+            )
+        })?;
+        (payload, macos_app::executable_in_bundle(path))
+    } else {
+        (path.to_path_buf(), Some(path.to_path_buf()))
+    };
+    let exe = exe.as_path();
     let footer = payload::read_footer(exe)?.with_context(|| {
         format!(
             "{} is not a packed Porthole app (no payload footer)",
-            exe.display()
+            path.display()
         )
     })?;
     let payload = Payload::new(exe, &footer);
     let (entries, verified) = payload.list()?;
     let (app_toml, info) = payload.read_meta()?;
 
-    println!("{}", exe.display());
+    println!("{}", path.display());
     println!("  footer version   {}", footer.version);
-    println!("  launcher         {}", size(footer.payload_offset));
+    if let Some(launcher) = &launcher {
+        let kind = exe::kind(launcher)?;
+        let len = if launcher == exe {
+            footer.payload_offset
+        } else {
+            fs::metadata(launcher)?.len()
+        };
+        println!("  launcher         {}, {}", size(len), kind.describe());
+        let file_len = fs::metadata(launcher)?.len();
+        if let Some(pe) = exe::pe_header(&mut File::open(launcher)?)?
+            && let Some(at) = pe.signed_end(file_len)
+        {
+            println!(
+                "  signature        Authenticode, {} at offset {at}",
+                size(file_len - at)
+            );
+        }
+    }
     println!(
         "  payload          {} at offset {}",
         size(footer.payload_len),
@@ -538,6 +702,7 @@ mod tests {
             PackOptions {
                 output: Some(out.clone()),
                 devtools: true,
+                ..Default::default()
             },
             &launcher,
         )
@@ -555,6 +720,7 @@ mod tests {
             PackOptions {
                 output: Some(dir.join("T2.bin")),
                 devtools: true,
+                ..Default::default()
             },
             &out,
         )
@@ -655,6 +821,7 @@ mod tests {
             PackOptions {
                 output: Some(out.clone()),
                 devtools: false,
+                ..Default::default()
             },
             &launcher,
         )
@@ -667,6 +834,122 @@ mod tests {
         assert_eq!(files["index.html"], b"<h1>hi</h1>");
         // Over the limit: the caller falls back to the cache.
         assert!(payload.load_app_files(5).unwrap().is_none());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    fn static_app(dir: &Path) -> PathBuf {
+        fs::create_dir_all(dir.join("web")).unwrap();
+        fs::write(dir.join("web/index.html"), "<h1>hi</h1>").unwrap();
+        fs::write(dir.join("icon.png"), crate::icon::tests::sample_png(32, 32)).unwrap();
+        let config = dir.join("app.toml");
+        fs::write(
+            &config,
+            "[app]\nname = \"Site\"\nid = \"site\"\nicon = \"icon.png\"\n[static]\nroot = \"web\"\n",
+        )
+        .unwrap();
+        config
+    }
+
+    #[test]
+    fn windows_launchers_become_gui_programs() {
+        let dir = temp_dir("windows");
+        let config = static_app(&dir);
+        let launcher = dir.join("porthole.exe");
+        // A console launcher that was signed: the copy loses the signature.
+        let mut pe = crate::exe::tests::fake_pe(3, 5);
+        let unsigned_len = pe.len();
+        crate::exe::tests::fake_sign(&mut pe);
+        fs::write(&launcher, &pe).unwrap();
+
+        let packed = pack_with(
+            &config,
+            PackOptions {
+                target: Some("x86_64-pc-windows-msvc".into()),
+                ..Default::default()
+            },
+            &launcher,
+        );
+        // No `-o`: the default name gets `.exe` (in the current folder).
+        let packed = packed.unwrap();
+        assert_eq!(packed.output.file_name().unwrap(), "Site.exe");
+        let out = packed.output.clone();
+        let mut file = File::open(&out).unwrap();
+        let header = exe::pe_header(&mut file).unwrap().unwrap();
+        assert_eq!(header.subsystem, 2, "GUI subsystem");
+        assert_eq!(header.certificates, (0, 0));
+        assert!(packed.footer.payload_offset <= unsigned_len as u64 + 8);
+        assert_eq!(
+            payload::read_footer(&out).unwrap(),
+            Some(packed.footer.clone())
+        );
+        let _ = fs::remove_file(&out);
+
+        // The wrong platform is refused.
+        let err = pack_with(
+            &config,
+            PackOptions {
+                target: Some("x86_64-unknown-linux-gnu".into()),
+                output: Some(dir.join("x")),
+                ..Default::default()
+            },
+            &launcher,
+        )
+        .err()
+        .unwrap();
+        assert!(format!("{err:#}").contains("not one for"), "{err:#}");
+        let err = pack_with(
+            &config,
+            PackOptions {
+                macos_app: true,
+                output: Some(dir.join("x.app")),
+                ..Default::default()
+            },
+            &launcher,
+        )
+        .err()
+        .unwrap();
+        assert!(format!("{err:#}").contains("macOS launcher"), "{err:#}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn macos_app_bundle() {
+        let dir = temp_dir("macos");
+        let config = static_app(&dir);
+        let launcher = dir.join("porthole");
+        let mut macho = vec![0u8; 64];
+        macho[..4].copy_from_slice(&[0xcf, 0xfa, 0xed, 0xfe]);
+        macho[4..8].copy_from_slice(&0x0100_000cu32.to_le_bytes());
+        fs::write(&launcher, &macho).unwrap();
+
+        let app = dir.join("Site.app");
+        fs::create_dir_all(&app).unwrap();
+        // An existing non-bundle folder is not replaced.
+        let opts = || PackOptions {
+            macos_app: true,
+            output: Some(app.clone()),
+            ..Default::default()
+        };
+        assert!(pack_with(&config, opts(), &launcher).is_err());
+        fs::remove_dir_all(&app).unwrap();
+
+        let packed = pack_with(&config, opts(), &launcher).unwrap();
+        assert!(packed.bundle);
+        // Again, over the previous bundle.
+        let packed = pack_with(&config, opts(), &launcher).unwrap();
+        assert_eq!(fs::read(app.join("Contents/MacOS/Site")).unwrap(), macho);
+        let payload_file = app.join("Contents/Resources/payload.tar.zst");
+        let footer = payload::read_footer(&payload_file).unwrap().unwrap();
+        assert_eq!(footer, packed.footer);
+        assert_eq!(footer.payload_offset, 0);
+        assert!(app.join("Contents/Resources/AppIcon.icns").is_file());
+        let plist = fs::read_to_string(app.join("Contents/Info.plist")).unwrap();
+        assert!(plist.contains("<string>Site</string>"));
+        let files = Payload::new(&payload_file, &footer)
+            .load_app_files(1 << 20)
+            .unwrap()
+            .unwrap();
+        assert!(files.contains_key("index.html"));
         let _ = fs::remove_dir_all(&dir);
     }
 

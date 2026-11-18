@@ -27,7 +27,7 @@ pub enum Command {
     /// payload. The result runs the app when started.
     Pack(PackArgs),
 
-    /// Show what a packed executable contains.
+    /// Show what a packed executable (or `.app` bundle) contains.
     Inspect(InspectArgs),
 }
 
@@ -45,11 +45,28 @@ pub struct PackArgs {
     /// Allow the web inspector in the packed app. Off by default.
     #[arg(long)]
     pub devtools: bool,
+
+    /// Pack for another platform, using the prebuilt launcher from this
+    /// version's GitHub release (downloaded once, then cached). One of
+    /// x86_64-pc-windows-msvc, x86_64-apple-darwin, aarch64-apple-darwin,
+    /// x86_64-unknown-linux-gnu.
+    #[arg(long, value_name = "TRIPLE")]
+    pub target: Option<String>,
+
+    /// Pack onto this launcher binary instead (a `porthole` built for the
+    /// platform the app is for). With `--target`, it must match it.
+    #[arg(long, value_name = "FILE")]
+    pub launcher: Option<PathBuf>,
+
+    /// Write a macOS `.app` bundle (needed to sign and notarize), with the
+    /// payload in `Contents/Resources`. Needs a macOS launcher.
+    #[arg(long)]
+    pub macos_app: bool,
 }
 
 #[derive(Debug, Args)]
 pub struct InspectArgs {
-    /// A packed executable.
+    /// A packed executable, or a `.app` bundle.
     #[arg(value_name = "EXE")]
     pub exe: PathBuf,
 }

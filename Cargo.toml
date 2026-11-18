@@ -1,6 +1,6 @@
 [package]
 name = "porthole-cli"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2024"
 rust-version = "1.90"
 description = "Turn a backend + localhost web UI into a single desktop app using the OS webview"
@@ -23,6 +23,8 @@ humantime = "2.4"
 mime_guess = { version = "2.0", default-features = false }
 open = "5.4"
 percent-encoding = "2.3"
+# Decodes `app.icon` for the window icon.
+png = "0.18"
 # Native error dialogs. On Linux, use GTK (already linked for the webview)
 # rather than the XDG portal, which would pull in an async runtime.
 rfd = { version = "0.17", default-features = false, features = ["gtk3"] }
@@ -47,6 +49,7 @@ muda = { version = "0.21", default-features = false }
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
+    "Win32_Graphics_Dwm",
     "Win32_Security",
     "Win32_System_Console",
     "Win32_System_JobObjects",

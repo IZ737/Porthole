@@ -1,9 +1,8 @@
 //! `app.toml`: the app's description, read by `porthole run app.toml`.
 //!
 //! Parsing is strict (unknown keys are errors) so typos fail loudly instead
-//! of being silently ignored. Keys that belong to later milestones (title
-//! bar modes) are accepted where the format is final, and
-//! [`Config::warnings`] says what this version ignores.
+//! of being silently ignored. [`Config::warnings`] lists settings that
+//! have no effect on this platform or in this combination.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -18,6 +17,8 @@ pub struct Config {
     pub window: WindowSection,
     pub mode: Mode,
     pub auth: AuthSection,
+    /// `app.icon`, resolved against the folder `app.toml` is in.
+    pub icon_path: Option<PathBuf>,
 }
 
 /// How the app is served: exactly one of `[sidecar]` and `[static]`.
@@ -34,7 +35,10 @@ pub struct AppSection {
     /// Reverse-DNS style id, e.g. `com.example.myapp`. Names the data folder
     /// and the single-instance lock.
     pub id: String,
-    /// App icon, bundled by `pack`. Not shown by the window yet (v0.5).
+    /// The app's version, for the macOS bundle's Info.plist.
+    pub version: Option<String>,
+    /// App icon (PNG), bundled by `pack`: the window and taskbar icon, and
+    /// the Dock icon of a `pack --macos-app` bundle.
     pub icon: Option<String>,
 }
 
@@ -48,6 +52,8 @@ pub struct WindowSection {
     pub resizable: bool,
     pub title_bar: TitleBar,
     pub theme: Theme,
+    /// `#rrggbb`: the native title bar's colour, where the OS allows it
+    /// (Windows 11, macOS).
     pub bar_color: Option<String>,
     pub single_instance: bool,
     pub remember_window: bool,
@@ -69,11 +75,41 @@ impl Default for WindowSection {
     }
 }
 
+impl WindowSection {
+    /// `bar_color` as red, green, blue (validated when parsing).
+    pub fn bar_rgb(&self) -> Option<(u8, u8, u8)> {
+        self.bar_color.as_deref().and_then(parse_hex_color)
+    }
+}
+
+/// `#rrggbb` (or `#rgb`) as red, green, blue.
+pub fn parse_hex_color(s: &str) -> Option<(u8, u8, u8)> {
+    let hex = s.strip_prefix('#')?;
+    if !hex.chars().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
+    let channel = |i: usize, len: usize| {
+        let v = u8::from_str_radix(&hex[i * len..(i + 1) * len], 16).ok()?;
+        Some(if len == 1 { v * 17 } else { v })
+    };
+    let len = match hex.len() {
+        6 => 2,
+        3 => 1,
+        _ => return None,
+    };
+    Some((channel(0, len)?, channel(1, len)?, channel(2, len)?))
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum TitleBar {
+    /// The OS title bar.
     Native,
+    /// No OS title bar: the page draws its own, using the injected
+    /// `window.porthole.window` API and `data-porthole-drag` regions.
     Custom,
+    /// macOS: the page runs under a transparent title bar that keeps the
+    /// traffic-light buttons. Same as `Custom` elsewhere.
     Overlay,
 }
 
@@ -215,6 +251,12 @@ impl Config {
         if raw.window.width < 100 || raw.window.height < 100 {
             bail!("`window.width` and `window.height` must be at least 100");
         }
+        if let Some(c) = &raw.window.bar_color
+            && parse_hex_color(c).is_none()
+        {
+            bail!("`window.bar_color` must be a colour like \"#1e1e2e\"; got {c:?}");
+        }
+        let icon_path = raw.app.icon.as_ref().map(|i| base_dir.join(i));
 
         let mode = match (raw.sidecar, raw.static_) {
             (Some(_), Some(_)) => bail!("use either [sidecar] or [static], not both"),
@@ -228,6 +270,7 @@ impl Config {
             window: raw.window,
             mode,
             auth: raw.auth,
+            icon_path,
         })
     }
 
@@ -236,18 +279,27 @@ impl Config {
         self.window.title.as_deref().unwrap_or(&self.app.name)
     }
 
-    /// Settings this version accepts but does not act on yet.
+    /// Settings that have no effect here.
     pub fn warnings(&self) -> Vec<String> {
+        self.warnings_for(std::env::consts::OS)
+    }
+
+    fn warnings_for(&self, os: &str) -> Vec<String> {
         let mut out = Vec::new();
-        if self.window.title_bar != TitleBar::Native {
-            out.push(
-                "`window.title_bar` modes other than \"native\" arrive in v0.5; \
-                 using the native title bar"
-                    .to_owned(),
-            );
-        }
         if self.window.bar_color.is_some() {
-            out.push("`window.bar_color` arrives in v0.5; ignoring it".to_owned());
+            if self.window.title_bar != TitleBar::Native {
+                out.push(
+                    "`window.bar_color` only applies to the native title bar; \
+                     colour a custom one with CSS"
+                        .to_owned(),
+                );
+            } else if os == "linux" {
+                out.push(
+                    "`window.bar_color` is not supported on Linux, where the desktop \
+                     theme draws the title bar"
+                        .to_owned(),
+                );
+            }
         }
         out
     }
@@ -426,6 +478,7 @@ mod tests {
         assert_eq!((c.window.width, c.window.height), (1000, 700));
         assert!(!c.window.resizable && !c.window.single_instance && !c.window.remember_window);
         assert_eq!(c.window.theme, Theme::Dark);
+        assert_eq!(c.icon_path.as_deref(), Some(Path::new("/base/icon.png")));
         assert_eq!(c.sidecar().path, Path::new("/base").join("dist/"));
         assert_eq!(c.sidecar().ready_path.as_deref(), Some("/healthz"));
         assert_eq!(c.sidecar().ready_timeout, Duration::from_secs(5));
@@ -514,20 +567,25 @@ mod tests {
     }
 
     #[test]
-    fn warns_about_later_features() {
-        let c = parse(
-            r##"
-            [app]
-            name = "A"
-            id = "a"
-            [window]
-            title_bar = "custom"
-            bar_color = "#000000"
-            [sidecar]
-            path = "x"
-            "##,
-        )
-        .unwrap();
-        assert_eq!(c.warnings().len(), 2);
+    fn bar_color() {
+        let with = |window: &str| {
+            parse(&format!(
+                "[app]\nname = \"A\"\nid = \"a\"\n[window]\n{window}\n[sidecar]\npath = \"x\"\n"
+            ))
+        };
+        let c = with("bar_color = \"#1e1E2e\"").unwrap();
+        assert_eq!(c.window.bar_rgb(), Some((0x1e, 0x1e, 0x2e)));
+        assert!(c.warnings_for("windows").is_empty());
+        assert_eq!(c.warnings_for("linux").len(), 1);
+        assert_eq!(parse_hex_color("#fa0"), Some((255, 170, 0)));
+        for bad in ["red", "#12345", "1e1e2e", "#gggggg", "#+1+1+1"] {
+            assert!(parse_hex_color(bad).is_none(), "{bad}");
+        }
+        let err = format!("{:#}", with("bar_color = \"blue\"").unwrap_err());
+        assert!(err.contains("bar_color"), "{err}");
+
+        let c = with("title_bar = \"custom\"\nbar_color = \"#000000\"").unwrap();
+        assert_eq!(c.window.title_bar, TitleBar::Custom);
+        assert_eq!(c.warnings_for("macos").len(), 1);
     }
 }

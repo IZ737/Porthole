@@ -103,22 +103,45 @@ pub fn read_footer(path: &Path) -> Result<Option<Footer>> {
 
 fn read_footer_from(file: &mut File) -> Result<Option<Footer>> {
     let file_len = file.metadata()?.len();
-    if file_len < FOOTER_LEN as u64 {
-        return Ok(None);
+    // A signed Windows exe has the Authenticode certificate table after
+    // the footer, and `signtool` pads the file to 8 bytes before adding
+    // it. The table's position comes from the PE header.
+    let (end, max_pad) = match crate::exe::pe_header(file).ok().flatten() {
+        Some(pe) => match pe.signed_end(file_len) {
+            Some(end) => (end, 7),
+            None => (file_len, 0),
+        },
+        None => (file_len, 0),
+    };
+    let mut found = None;
+    for pad in 0..=max_pad {
+        let Some(footer_end) = end.checked_sub(pad) else {
+            break;
+        };
+        if footer_end < FOOTER_LEN as u64 {
+            break;
+        }
+        file.seek(SeekFrom::Start(footer_end - FOOTER_LEN as u64))?;
+        let mut bytes = [0u8; FOOTER_LEN];
+        file.read_exact(&mut bytes)?;
+        let mut padding = vec![0u8; pad as usize];
+        file.read_exact(&mut padding)?;
+        if padding.iter().any(|b| *b != 0) {
+            break;
+        }
+        if let Some(footer) = Footer::decode(&bytes)? {
+            found = Some((footer, footer_end));
+            break;
+        }
     }
-    file.seek(SeekFrom::End(-(FOOTER_LEN as i64)))?;
-    let mut bytes = [0u8; FOOTER_LEN];
-    file.read_exact(&mut bytes)?;
-    let Some(footer) = Footer::decode(&bytes)? else {
+    let Some((footer, footer_end)) = found else {
         return Ok(None);
     };
-    // Unsigned files end with the footer. (Signed Windows exes, where the
-    // certificate table follows it, are a v0.5 concern.)
     let end = footer
         .payload_offset
         .checked_add(footer.payload_len)
         .and_then(|e| e.checked_add(FOOTER_LEN as u64));
-    if end != Some(file_len) {
+    if end != Some(footer_end) {
         bail!(
             "the payload footer says the payload is {} bytes at offset {}, which does not fit a {file_len}-byte file",
             footer.payload_len,
@@ -276,23 +299,38 @@ impl<'a> Payload<'a> {
     /// They are not verified here: whatever runs the app checks the hash
     /// before using any of its files.
     pub fn read_meta(&self) -> Result<(String, PackInfo)> {
-        let (mut app_toml, mut pack_toml) = (None, None);
+        let meta = self.read_meta_and_icon()?;
+        Ok((meta.0, meta.1))
+    }
+
+    /// [`Payload::read_meta`], plus the icon's bytes if the app has one
+    /// (it follows `pack.toml`). Not verified either: it is only decoded
+    /// for the window icon.
+    pub fn read_meta_and_icon(&self) -> Result<(String, PackInfo, Option<Vec<u8>>)> {
+        let (mut app_toml, mut pack_toml, mut icon) = (None, None, None);
         self.walk(|entry| {
             let name = entry.path()?.to_string_lossy().into_owned();
-            let slot = match name.as_str() {
-                APP_TOML => &mut app_toml,
-                PACK_TOML => &mut pack_toml,
-                _ => return Ok(false),
-            };
-            let mut text = String::new();
-            entry.read_to_string(&mut text)?;
-            *slot = Some(text);
-            Ok(app_toml.is_none() || pack_toml.is_none())
+            if name == APP_TOML || name == PACK_TOML {
+                let mut text = String::new();
+                entry.read_to_string(&mut text)?;
+                *(if name == APP_TOML {
+                    &mut app_toml
+                } else {
+                    &mut pack_toml
+                }) = Some(text);
+                return Ok(true);
+            }
+            if name == "icon" || name.starts_with("icon.") {
+                let mut bytes = Vec::new();
+                entry.read_to_end(&mut bytes)?;
+                icon = Some(bytes);
+            }
+            Ok(false)
         })?;
         let app_toml = app_toml.context("the payload has no app.toml")?;
         let pack_toml = pack_toml.context("the payload has no pack.toml")?;
         let info = toml::from_str(&pack_toml).context("the payload's pack.toml is invalid")?;
-        Ok((app_toml, info))
+        Ok((app_toml, info, icon))
     }
 
     /// Unpack everything into `dest` (which must exist), then verify the
@@ -463,6 +501,26 @@ mod tests {
 
         std::fs::write(&path, b"short").unwrap();
         assert_eq!(read_footer(&path).unwrap(), None);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn finds_the_footer_of_a_signed_exe() {
+        let path = std::env::temp_dir().join(format!("porthole-signed-{}", std::process::id()));
+        // A launcher, a payload, the footer, then what signtool adds:
+        // padding to 8 bytes and the certificate table.
+        let mut bytes = crate::exe::tests::fake_pe(3, 0);
+        let footer = Footer {
+            payload_offset: bytes.len() as u64,
+            payload_len: 13,
+            ..footer()
+        };
+        bytes.extend_from_slice(&[1; 13]);
+        bytes.extend_from_slice(&footer.encode());
+        assert_ne!(bytes.len() % 8, 0, "the test needs padding");
+        crate::exe::tests::fake_sign(&mut bytes);
+        std::fs::write(&path, &bytes).unwrap();
+        assert_eq!(read_footer(&path).unwrap(), Some(footer));
         let _ = std::fs::remove_file(&path);
     }
 
