@@ -10,7 +10,7 @@
 //!   a signed exe, after the payload footer.
 
 use std::fs::File;
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
@@ -263,21 +263,20 @@ impl PeHeader {
     }
 }
 
-/// Prepare a copy of a Windows launcher (`out`, already written) to carry
-/// a payload: switch a console launcher to the GUI subsystem so the app
-/// opens no console window, and clear a signature the launcher came with
-/// (it no longer covers the file; sign the packed exe instead).
-pub fn prepare_windows_copy(out: &mut File, header: &PeHeader) -> Result<()> {
+/// Prepare a copy of a Windows launcher (`image`, the launcher's bytes
+/// without payload or signature) to carry a payload: switch a console
+/// launcher to the GUI subsystem so the app opens no console window, and
+/// clear a signature the launcher came with (it no longer covers the file;
+/// sign the packed exe instead).
+pub fn prepare_windows_copy(image: &mut [u8], header: &PeHeader) {
     if header.subsystem == SUBSYSTEM_CONSOLE {
-        out.seek(SeekFrom::Start(header.subsystem_at))?;
-        out.write_all(&SUBSYSTEM_GUI.to_le_bytes())?;
+        let at = header.subsystem_at as usize;
+        image[at..at + 2].copy_from_slice(&SUBSYSTEM_GUI.to_le_bytes());
     }
     if header.certificates != (0, 0) {
-        out.seek(SeekFrom::Start(header.security_entry_at))?;
-        out.write_all(&[0u8; 8])?;
+        let at = header.security_entry_at as usize;
+        image[at..at + 8].fill(0);
     }
-    out.seek(SeekFrom::End(0))?;
-    Ok(())
 }
 
 #[cfg(test)]
@@ -334,16 +333,8 @@ pub mod tests {
         let signed_at = header.signed_end(pe.len() as u64).unwrap();
         assert_eq!(signed_at, pe.len() as u64 - 40);
 
-        let path = std::env::temp_dir().join(format!("porthole-pe-{}", std::process::id()));
-        std::fs::write(&path, &pe[..signed_at as usize]).unwrap();
-        let mut out = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&path)
-            .unwrap();
-        prepare_windows_copy(&mut out, &header).unwrap();
-        drop(out);
-        let patched = std::fs::read(&path).unwrap();
+        let mut patched = pe[..signed_at as usize].to_vec();
+        prepare_windows_copy(&mut patched, &header);
         let header = pe_header(&mut Cursor::new(&patched)).unwrap().unwrap();
         assert_eq!(header.subsystem, SUBSYSTEM_GUI);
         assert_eq!(header.certificates, (0, 0));
@@ -354,7 +345,6 @@ pub mod tests {
             }
             .runs_on("x86_64-pc-windows-msvc")
         );
-        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

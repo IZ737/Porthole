@@ -4,7 +4,7 @@ name: Release
 # publishes them on the GitHub release for the tag. Push a tag that matches
 # Cargo.toml's version:
 #
-#   git tag v0.5.0 && git push origin v0.5.0
+#   git tag v1.0.0 && git push origin v1.0.0
 #
 # Run it by hand (workflow_dispatch) to build the assets without publishing.
 

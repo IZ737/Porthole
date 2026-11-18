@@ -5,13 +5,14 @@ opens the app's local URL in the operating system's own webview (WebView2,
 WKWebView or WebKitGTK), so the launcher stays around 1–3 MB instead of
 shipping a browser.
 
-> **Status: v0.5.** Porthole can start your backend as a sidecar, serve a
+> **Status: v1.0.** Porthole can start your backend as a sidecar, serve a
 > static site itself, or open a window on a server you have already
 > started, and `pack` turns any of the first two into a single executable,
 > for Windows, macOS or Linux from any of them. Apps can draw their own
 > title bar. The [auth kit](auth-kit) protects a sidecar in one line for
-> Express and FastAPI, and the examples cover Python, Node and Go. v1.0
-> freezes the packed format. See the [roadmap](#roadmap).
+> Express and FastAPI, and the examples cover Python, Node and Go. The
+> packed format is [frozen for 1.x](FORMAT.md); see
+> [Stability](#stability) for what else 1.x promises.
 
 ## Pack an app into one executable
 
@@ -146,9 +147,10 @@ download.
 [ launcher binary ][ payload: tar.zst ][ footer: 58 bytes ]
 ```
 
-The footer is little-endian: `magic` (8 bytes, `PRTHOLE\0`), `version`
-(2, currently 1), `payload_offset` (8), `payload_len` (8) and `sha256` (32,
-of the compressed payload). The payload holds `app.toml` (with its paths
+[FORMAT.md](FORMAT.md) is the full specification, frozen for every 1.x
+release. In short: the footer is little-endian `magic` (8 bytes,
+`PRTHOLE\0`), `version` (2, always 1 in 1.x), `payload_offset` (8),
+`payload_len` (8) and `sha256` (32, of the compressed payload). The payload holds `app.toml` (with its paths
 rewritten to point into the payload), `pack.toml` (the Porthole version
 and `--devtools`), the optional icon, and `app/`.
 
@@ -185,6 +187,8 @@ developing; a packed app holds the whole site in memory. See
 - `Content-Type` comes from the file extension, including
   `application/wasm` for streaming WebAssembly compilation.
 - `/` and folders serve their `index.html`. Missing files get a 404 page.
+- Byte-range requests are answered (`206 Partial Content`), so `<video>`
+  and `<audio>` can seek.
 - The default Content-Security-Policy only lets scripts load from the app
   itself (no remote or inline scripts), and allows remote images, styles,
   fonts and HTTPS API calls. Set `static.csp` to replace it.
@@ -355,8 +359,10 @@ launcher ignores messages from any origin other than the app's own.
   starting in the user's Downloads folder.
 - **`<input type="file">`** uses each webview's native file picker.
 - **`app.icon`** (a PNG up to 1024 × 1024) is the window and taskbar icon
-  on Windows and Linux, and the Dock icon of a `--macos-app` bundle. The
-  icon Windows Explorer shows for the `.exe` file itself is not set.
+  on Windows and Linux, the Dock icon of a `--macos-app` bundle, and the
+  icon Windows Explorer shows for a packed `.exe` (`pack` writes it into
+  the exe's resources, also when cross-packing from macOS or Linux). Use a
+  square PNG of at least 256 × 256 for sharp icons at every size.
 - **WebView2** ships with Windows 11 but is missing on some Windows 10
   machines. Porthole checks for it at launch and, if it is missing, offers
   to open Microsoft's download page.
@@ -548,7 +554,7 @@ macOS bundle after codesigning it.
 
 ### Releases
 
-Pushing a tag such as `v0.5.0` (matching `version` in `Cargo.toml`) runs
+Pushing a tag such as `v1.0.0` (matching `version` in `Cargo.toml`) runs
 the release workflow: it builds the launchers for the four targets in
 [Cross-packing](#cross-packing), and publishes them on a GitHub release with
 `SHA256SUMS`. That is where `pack --target` downloads from.
@@ -566,9 +572,34 @@ the release workflow: it builds the launchers for the four targets in
    icons, downloads, a stable sidecar port, Windows apps without a
    console, signing support, `.app` bundles, cross-packing from prebuilt
    release launchers, a Go example, and a startup budget in CI.
-6. **v1.0** once the packed format is frozen. After that: static + sidecar
-   proxy mode, file associations and deep links, tray icon, auto-update,
-   multiple windows.
+6. **v1.0 — Stable.** The [packed format](FORMAT.md) is frozen, the
+   `.exe` file shows the app's icon in Explorer, and static sites answer
+   range requests.
+
+After 1.0: static + sidecar proxy mode, file associations and deep links,
+tray icon, auto-update, multiple windows.
+
+## Stability
+
+From 1.0, Porthole follows semantic versioning. Within 1.x:
+
+- **Packed apps** keep running: any 1.x launcher reads any app packed by
+  1.x ([FORMAT.md](FORMAT.md)).
+- **`app.toml`** only gains optional keys; existing keys keep their
+  meaning. Unknown keys stay errors, so typos fail loudly.
+- **The CLI** (`run`, `pack`, `inspect` and their flags) and a packed
+  app's own flags (`--console`, `--verify`) keep working as documented.
+- **What your backend gets** (`APP_PORT`, `APP_TOKEN`, `APP_DATA_DIR`), the
+  [auth handshake](#auth-handshake) and the window-control API
+  (`window.porthole.window`) don't change incompatibly.
+
+Log file names and layout, cache folder paths, `inspect`'s output and the
+exact wording of messages are not covered and may change.
+
+Known limitations in 1.0: one window per app; a static app can't also run
+a sidecar; on Windows 11 a custom title bar has no snap-layout flyout (see
+[Title bar](#title-bar)); links and `window.open` to other sites go to the
+browser, but a script that sets `location` to another site is not stopped.
 
 ## Licence
 

@@ -96,7 +96,11 @@ impl StaticSite {
     pub fn handle(&self, request: &Request<Vec<u8>>) -> Response<Cow<'static, [u8]>> {
         let method = request.method();
         let path = request.uri().path();
-        let mut response = self.respond(method, path);
+        let range = request
+            .headers()
+            .get(header::RANGE)
+            .and_then(|v| v.to_str().ok());
+        let mut response = self.respond(method, path, range);
         if method == Method::HEAD {
             *response.body_mut() = Cow::Borrowed(&[]);
         }
@@ -106,7 +110,12 @@ impl StaticSite {
         response
     }
 
-    fn respond(&self, method: &Method, path: &str) -> Response<Cow<'static, [u8]>> {
+    fn respond(
+        &self,
+        method: &Method,
+        path: &str,
+        range: Option<&str>,
+    ) -> Response<Cow<'static, [u8]>> {
         if method != Method::GET && method != Method::HEAD {
             return self.simple(
                 StatusCode::METHOD_NOT_ALLOWED,
@@ -139,7 +148,29 @@ impl StaticSite {
                 .flatten()
         });
         match hit {
-            Some((file, body)) => self.ok(&file, body),
+            Some((file, body)) => match range.map(|r| parse_range(r, body.len() as u64)) {
+                // A single satisfiable range: what media elements ask for
+                // when seeking.
+                Some(Some(Ok((start, end)))) => {
+                    let len = body.len();
+                    let part = match body {
+                        Cow::Borrowed(b) => Cow::Borrowed(&b[start as usize..=end as usize]),
+                        Cow::Owned(b) => Cow::Owned(b[start as usize..=end as usize].to_vec()),
+                    };
+                    self.builder(StatusCode::PARTIAL_CONTENT, &content_type(&file))
+                        .header(header::CONTENT_RANGE, format!("bytes {start}-{end}/{len}"))
+                        .body(part)
+                        .expect("valid response")
+                }
+                Some(Some(Err(()))) => self
+                    .builder(StatusCode::RANGE_NOT_SATISFIABLE, "text/plain")
+                    .header(header::CONTENT_RANGE, format!("bytes */{}", body.len()))
+                    .body(Cow::Borrowed(&b"range not satisfiable"[..]))
+                    .expect("valid response"),
+                // No range, or one this server ignores (several ranges, or
+                // another unit): the whole file, which HTTP allows.
+                _ => self.ok(&file, body),
+            },
             None => self.not_found(),
         }
     }
@@ -175,10 +206,46 @@ impl StaticSite {
             .header(header::CONTENT_TYPE, content_type)
             .header(header::CONTENT_SECURITY_POLICY, &self.csp)
             .header(header::X_CONTENT_TYPE_OPTIONS, "nosniff")
+            .header(header::ACCEPT_RANGES, "bytes")
             // The origin stays the same across app versions, so make the
             // webview ask again rather than reuse an older version's file.
             .header(header::CACHE_CONTROL, "no-cache")
     }
+}
+
+/// Parse a `Range` header against a file of `len` bytes. `None` to ignore
+/// it (not a single byte range), `Some(Err)` if it can't be satisfied, else
+/// the inclusive first and last byte.
+fn parse_range(header: &str, len: u64) -> Option<Result<(u64, u64), ()>> {
+    let spec = header.trim().strip_prefix("bytes=")?.trim();
+    if spec.contains(',') {
+        return None;
+    }
+    let (first, last) = spec.split_once('-')?;
+    let (first, last) = (first.trim(), last.trim());
+    let range = if first.is_empty() {
+        // The last N bytes.
+        let n: u64 = last.parse().ok()?;
+        if n == 0 || len == 0 {
+            return Some(Err(()));
+        }
+        (len.saturating_sub(n), len - 1)
+    } else {
+        let start: u64 = first.parse().ok()?;
+        let end = if last.is_empty() {
+            u64::MAX
+        } else {
+            last.parse().ok()?
+        };
+        if end < start {
+            return None;
+        }
+        if start >= len {
+            return Some(Err(()));
+        }
+        (start, end.min(len - 1))
+    };
+    Some(Ok(range))
 }
 
 /// Turn a request path into a relative file path with `/` separators, and
@@ -262,6 +329,68 @@ mod tests {
             ct,
             String::from_utf8_lossy(r.body()).into_owned(),
         )
+    }
+
+    fn get_range(site: &StaticSite, path: &str, range: &str) -> (u16, Option<String>, String) {
+        let request = Request::builder()
+            .uri(format!("porthole://localhost{path}"))
+            .header(header::RANGE, range)
+            .body(Vec::new())
+            .unwrap();
+        let r = site.handle(&request);
+        assert_eq!(r.headers()[header::ACCEPT_RANGES], "bytes");
+        (
+            r.status().as_u16(),
+            r.headers()
+                .get(header::CONTENT_RANGE)
+                .map(|v| v.to_str().unwrap().to_owned()),
+            String::from_utf8_lossy(r.body()).into_owned(),
+        )
+    }
+
+    #[test]
+    fn serves_byte_ranges() {
+        let s = site(false);
+        // "space" is 5 bytes.
+        let ok = |a: &str, b: &str| (206, Some(a.to_owned()), b.to_owned());
+        assert_eq!(
+            get_range(&s, "/a%20b.txt", "bytes=0-1"),
+            ok("bytes 0-1/5", "sp")
+        );
+        assert_eq!(
+            get_range(&s, "/a%20b.txt", "bytes=2-"),
+            ok("bytes 2-4/5", "ace")
+        );
+        assert_eq!(
+            get_range(&s, "/a%20b.txt", "bytes=-2"),
+            ok("bytes 3-4/5", "ce")
+        );
+        assert_eq!(
+            get_range(&s, "/a%20b.txt", "bytes=3-99"),
+            ok("bytes 3-4/5", "ce")
+        );
+        assert_eq!(
+            get_range(&s, "/a%20b.txt", "bytes=-9"),
+            ok("bytes 0-4/5", "space")
+        );
+        assert_eq!(
+            get_range(&s, "/a%20b.txt", "bytes=5-"),
+            (
+                416,
+                Some("bytes */5".into()),
+                "range not satisfiable".into()
+            )
+        );
+        // Ignored: whole file.
+        for r in ["bytes=0-1,3-4", "items=0-1", "bytes=3-1", "bytes=x-"] {
+            assert_eq!(
+                get_range(&s, "/a%20b.txt", r),
+                (200, None, "space".into()),
+                "{r}"
+            );
+        }
+        // Missing files stay 404.
+        assert_eq!(get_range(&s, "/nope.mp4", "bytes=0-").0, 404);
     }
 
     #[test]

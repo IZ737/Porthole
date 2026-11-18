@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "porthole-auth"
-version = "0.4.0"
+version = "1.0.0"
 description = "Porthole's auth handshake as ASGI middleware for FastAPI and Starlette"
 readme = "README.md"
 license = "MIT OR Apache-2.0"

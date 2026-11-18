@@ -1,6 +1,6 @@
 [package]
 name = "porthole-cli"
-version = "0.5.0"
+version = "1.0.0"
 edition = "2024"
 rust-version = "1.90"
 description = "Turn a backend + localhost web UI into a single desktop app using the OS webview"
