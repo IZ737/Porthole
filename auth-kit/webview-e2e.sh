@@ -7,7 +7,9 @@
 #
 #   auth-kit/webview-e2e.sh <porthole binary> <app.toml> <app id>
 #
-# Needs a display: run it under `xvfb-run -a` on headless Linux.
+# Needs a display: run it under `xvfb-run -a` on headless Linux (and
+# `dbus-run-session --` where a user session bus is half set up, as on
+# GitHub runners).
 set -euo pipefail
 porthole=$1 app_toml=$2 app_id=$3
 

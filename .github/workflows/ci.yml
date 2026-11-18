@@ -122,6 +122,9 @@ jobs:
       # Launches the Express and FastAPI examples in a real webview and
       # checks the page's own API call gets through the auth handshake
       # (302, HttpOnly cookie, cookie sent on fetch).
+      # Launches the Express and FastAPI examples in a real webview and
+      # checks the page's own API call gets through the auth handshake
+      # (302, HttpOnly cookie, cookie sent on fetch).
       # TEMPORARY: find out why the page doesn't load on the runner.
       - name: Webview diagnostics (Linux)
         if: runner.os == 'Linux'
@@ -152,14 +155,14 @@ jobs:
       - name: Auth kit in a webview (Linux)
         if: runner.os == 'Linux'
         run: |
-          # WebKitGTK sandboxes its web process with bubblewrap, which needs
-          # unprivileged user namespaces; Ubuntu 24.04's AppArmor limits them.
-          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
           (cd examples/hello-express && npm ci --install-links)
           # requirements.txt paths are relative to the folder pip runs in.
           (cd examples/hello-fastapi && python3 -m pip install --user --break-system-packages -r requirements.txt)
-          xvfb-run -a auth-kit/webview-e2e.sh ./target/release/porthole examples/hello-express/app.toml dev.porthole.hello-express
-          xvfb-run -a auth-kit/webview-e2e.sh ./target/release/porthole examples/hello-fastapi/app.toml dev.porthole.hello-fastapi
+          # A private session bus: on the runner, GLib otherwise finds the
+          # systemd user bus in $XDG_RUNTIME_DIR and hangs authenticating to
+          # it, and WebKit never starts its web process (no page loads).
+          dbus-run-session -- xvfb-run -a auth-kit/webview-e2e.sh ./target/release/porthole examples/hello-express/app.toml dev.porthole.hello-express
+          dbus-run-session -- xvfb-run -a auth-kit/webview-e2e.sh ./target/release/porthole examples/hello-fastapi/app.toml dev.porthole.hello-fastapi
 
       - uses: actions/upload-artifact@v4
         with:
