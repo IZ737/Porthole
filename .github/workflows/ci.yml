@@ -131,21 +131,23 @@ jobs:
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
           bwrap --ro-bind / / true && echo "bwrap ok" || echo "bwrap FAILED"
           (cd examples/hello-express && npm ci --install-links)
+          echo "DBUS_SESSION_BUS_ADDRESS=${DBUS_SESSION_BUS_ADDRESS-unset} XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR-unset}"
           try() {
             echo "=== $*"
-            env "$@" xvfb-run -a bash -c '
-              export XDG_DATA_HOME=$(mktemp -d) PORTHOLE_NO_DIALOGS=1 G_MESSAGES_DEBUG=all
+            "$@" bash -c '
+              export XDG_DATA_HOME=$(mktemp -d) PORTHOLE_NO_DIALOGS=1
+              echo "bus: ${DBUS_SESSION_BUS_ADDRESS-unset}"
               ./target/release/porthole run examples/hello-express/app.toml --console > /tmp/ph.log 2>&1 & pid=$!
               sleep 8
-              ps -eo pid,args | grep -i -E "webkit|bwrap|dbus-proxy" | grep -v grep
+              ps -eo pid,args | grep -i -E "webkit|bwrap|dbus" | grep -v grep
+              sudo gdb -p $pid -batch -ex "thread apply all bt 12" 2>/dev/null | grep -E "^#|^Thread" | head -60
               kill $pid; sleep 1
-              grep -v "^$" /tmp/ph.log | grep -v -i "a11y" | tail -40
+              grep -v "^$" /tmp/ph.log | grep -v -i "a11y" | tail -15
             '
           }
-          try X=1
-          try WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS=1
-          try WEBKIT_DISABLE_DMABUF_RENDERER=1
-          try WEBKIT_DISABLE_COMPOSITING_MODE=1 WEBKIT_DISABLE_DMABUF_RENDERER=1
+          try xvfb-run -a
+          try env -u DBUS_SESSION_BUS_ADDRESS xvfb-run -a
+          try dbus-run-session -- xvfb-run -a
 
       - name: Auth kit in a webview (Linux)
         if: runner.os == 'Linux'
