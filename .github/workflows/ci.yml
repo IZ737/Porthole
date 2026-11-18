@@ -196,6 +196,10 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y libwebkit2gtk-4.1-0 xvfb
+          # WebKitGTK sandboxes its web process with bubblewrap, which needs
+          # unprivileged user namespaces; Ubuntu 24.04's AppArmor blocks
+          # them by default, and the page then never loads.
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
           chmod +x bin/porthole
           (cd examples/hello-express && npm ci --install-links)
           # requirements.txt paths are relative to the folder pip runs in.

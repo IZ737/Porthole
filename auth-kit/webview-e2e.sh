@@ -28,4 +28,6 @@ for _ in $(seq 1 100); do
 done
 echo "no authenticated API call within 20s; sidecar.log:"
 cat "$log" 2>/dev/null || true
+echo "porthole.log:"
+cat "$data/$app_id/logs/porthole.log" 2>/dev/null || true
 exit 1
