@@ -5,11 +5,13 @@ opens the app's local URL in the operating system's own webview (WebView2,
 WKWebView or WebKitGTK), so the launcher stays around 1–3 MB instead of
 shipping a browser.
 
-> **Status: v0.4.** Porthole can start your backend as a sidecar, serve a
+> **Status: v0.5.** Porthole can start your backend as a sidecar, serve a
 > static site itself, or open a window on a server you have already
-> started, and `pack` turns any of the first two into a single executable.
-> The [auth kit](auth-kit) protects a sidecar in one line for Express and
-> FastAPI. Release polish (v0.5) is next. See the [roadmap](#roadmap).
+> started, and `pack` turns any of the first two into a single executable,
+> for Windows, macOS or Linux from any of them. Apps can draw their own
+> title bar. The [auth kit](auth-kit) protects a sidecar in one line for
+> Express and FastAPI, and the examples cover Python, Node and Go. v1.0
+> freezes the packed format. See the [roadmap](#roadmap).
 
 ## Pack an app into one executable
 
@@ -28,15 +30,19 @@ command-line tool.
 
 | Flag | Meaning |
 | --- | --- |
-| `-o`, `--output <FILE>` | Where to write the executable. Default: `<app.name>` in the current folder |
+| `-o`, `--output <FILE>` | Where to write the executable. Default: `<app.name>` in the current folder (`.exe` for Windows, `.app` with `--macos-app`) |
 | `--devtools` | Allow the web inspector in the packed app (off by default) |
+| `--target <TRIPLE>` | Pack for another platform (see [Cross-packing](#cross-packing)) |
+| `--launcher <FILE>` | Pack onto this `porthole` binary instead of the running one |
+| `--macos-app` | Write a macOS `.app` bundle, which can be signed and notarized (see [Signing](#signing)) |
 
 `pack` bundles `sidecar.path` (one file or a whole folder, for runtimes
 such as Python, Node or .NET) or `static.root`, plus `app.icon` if set.
 Unix permission bits and symlinks are kept, so executables still run after
-unpacking. It packs for the platform it runs on: build Windows apps on
-Windows, and so on. Cross-packing, code signing and macOS `.app` bundles
-arrive in v0.5; sign *after* packing.
+unpacking. On Windows, the packed exe is a GUI program, so it opens no
+console window (the `porthole.exe` CLI itself stays a console program);
+`--console` attaches one when you want to see the logs. Sign *after*
+packing.
 
 **At launch**, a packed sidecar app unpacks once per version into
 `<cache dir>/porthole/<first 16 hex digits of the payload's sha256>/`
@@ -57,6 +63,83 @@ line is ignored:
 
 Set `PORTHOLE_CACHE_DIR` to use another cache folder.
 
+### Cross-packing
+
+`pack` copies the `porthole` binary it runs as, so by default it packs for
+its own platform. To pack for another one, name it:
+
+```sh
+porthole pack app.toml --target x86_64-pc-windows-msvc       # MyApp.exe
+porthole pack app.toml --target aarch64-apple-darwin --macos-app
+```
+
+| Target | Platform |
+| --- | --- |
+| `x86_64-pc-windows-msvc` | Windows x64 |
+| `x86_64-apple-darwin` | macOS on Intel |
+| `aarch64-apple-darwin` | macOS on Apple silicon |
+| `x86_64-unknown-linux-gnu` | Linux x64 |
+
+The launcher for that target comes from the GitHub release of the same
+Porthole version (`porthole-<version>-<target>[.exe]`), is checked against
+the release's `SHA256SUMS`, and is cached in
+`<cache dir>/porthole/launchers/`, so later packs work offline. Downloads
+use `curl`, which Windows 10+, macOS and most Linux systems include.
+`--launcher <FILE>` packs onto a `porthole` binary you already have (one
+you built yourself, or for a platform without a release), and `pack`
+refuses a launcher that doesn't match `--target`. Set
+`PORTHOLE_RELEASES_URL` to download from a mirror laid out like
+`<url>/v<version>/<asset>`.
+
+A static site packs for any platform as is. A sidecar must itself be built
+for the target platform: `pack` bundles whatever `sidecar.path` holds, so
+cross-pack a Go or .NET backend you cross-compiled, not a Linux virtualenv
+for Windows.
+
+### Signing
+
+Signatures cover the whole file, so the order is always pack, then sign,
+then (on macOS) notarize. Signing `porthole` before packing achieves
+nothing: `pack` drops a launcher's signature, since it would not cover the
+packed file anyway.
+
+**Windows.** Sign the packed exe with Authenticode as usual. Signing
+appends a certificate table after Porthole's footer; the launcher reads
+the PE header to find where the signed data ends and looks for its footer
+there. Unsigned self-extracting exes are what antivirus heuristics distrust
+most, so sign anything you distribute.
+
+```powershell
+signtool sign /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 /f cert.pfx /p $env:CERT_PASSWORD MyApp.exe
+porthole inspect MyApp.exe        # shows the signature and checks the payload
+```
+
+**macOS.** `codesign` rejects a Mach-O file with data appended, so a plain
+packed file can't be signed. Pack a `.app` bundle instead: the launcher
+goes in `Contents/MacOS` untouched, and the payload in
+`Contents/Resources/payload.tar.zst`. `app.icon` (a square PNG of 16 to
+1024 pixels) becomes the Dock icon, and `app.version` the bundle version.
+Then sign with a Developer ID, notarize, and staple:
+
+```sh
+porthole pack app.toml --macos-app -o MyApp.app
+codesign --force --deep --options runtime --timestamp --sign "Developer ID Application: You (TEAMID)" MyApp.app
+ditto -c -k --keepParent MyApp.app MyApp.zip
+xcrun notarytool submit MyApp.zip --apple-id you@example.com --team-id TEAMID --password "$APP_PASSWORD" --wait
+xcrun stapler staple MyApp.app
+```
+
+A sidecar that is itself a native program (a Go or .NET binary) is
+unpacked to the cache folder at launch and is not covered by the bundle's
+signature; with the hardened runtime, sign it before packing too
+(`codesign --options runtime --sign ... bin/server`). Interpreters such as
+`python3` from the user's system are not affected. For a quick local test
+without a Developer ID, sign ad hoc: `codesign --force --deep --sign -
+MyApp.app`.
+
+**Linux** has no platform-wide signing; publish a checksum next to the
+download.
+
 ### Packed file format
 
 ```
@@ -68,6 +151,12 @@ The footer is little-endian: `magic` (8 bytes, `PRTHOLE\0`), `version`
 of the compressed payload). The payload holds `app.toml` (with its paths
 rewritten to point into the payload), `pack.toml` (the Porthole version
 and `--devtools`), the optional icon, and `app/`.
+
+A signed Windows exe has the Authenticode certificate table after the
+footer (plus up to 7 bytes of zero padding before it). A `--macos-app`
+bundle keeps `[ payload ][ footer ]` in `Contents/Resources/payload.tar.zst`,
+with `payload_offset` 0; a launcher in `Contents/MacOS` with no footer of
+its own reads that file.
 
 ## Serve a static site
 
@@ -122,13 +211,17 @@ the backend. A complete example lives in
 [app]
 name = "MyApp"
 id = "com.example.myapp"    # names the data folder and the single-instance lock
+icon = "icon.png"           # optional: window and taskbar icon (PNG), Dock icon of a .app
+version = "1.2.0"           # optional: the .app bundle's version
 
 [window]
 title = "My App"            # default: app.name
 width = 1200
 height = 800
 resizable = true
+title_bar = "native"        # native | custom | overlay (see "Title bar")
 theme = "system"            # light | dark | system
+bar_color = "#1e1e2e"       # optional: native title bar colour (Windows 11, macOS)
 single_instance = true      # a second launch focuses the running window
 remember_window = true      # restore size, position and maximised state
 
@@ -161,7 +254,8 @@ The working directory is the sidecar's folder. The backend must enforce
 the [auth handshake](#auth-handshake): the [auth kit](auth-kit) does it in
 one line for Express and FastAPI, and
 [`examples/hello-python`](examples/hello-python) shows it in about 30
-lines of standard-library Python.
+lines of standard-library Python, [`examples/hello-go`](examples/hello-go)
+in Go's standard library.
 
 ### Startup, shutdown and crashes
 
@@ -179,6 +273,13 @@ lines of standard-library Python.
   reaper process on macOS. The backend runs in its own process group.
 - **If the backend exits** while the window is open, Porthole shows the
   error dialog and closes. There is no automatic restart.
+- **The port stays the same across launches.** The first launch picks a
+  random free port and remembers it in `APP_DATA_DIR/porthole-port`; later
+  launches reuse it. The page's origin (`http://127.0.0.1:<port>`) is then
+  stable, so `localStorage`, IndexedDB and other per-origin storage
+  survive a restart. If that port is taken, this launch uses another one
+  (and the page starts with empty storage) but keeps the remembered port
+  for next time. The token is still new on every launch.
 
 ### Data, logs and window state
 
@@ -192,6 +293,7 @@ keeps its own files there too:
 | `logs/porthole.log` | The launcher's log |
 | `logs/sidecar.log` | Your backend's stdout and stderr |
 | `porthole-window.json` | Saved window size, position and maximised state |
+| `porthole-port` | The sidecar's port, reused on the next launch |
 | `webview/` | The webview's cookies, storage and caches |
 | `porthole.lock`, `porthole-instance` | Single-instance lock and hand-over |
 
@@ -201,6 +303,63 @@ primary display.
 
 Set `PORTHOLE_NO_DIALOGS=1` to skip error dialogs on headless machines
 such as CI; errors still go to stderr and the log.
+
+## Title bar
+
+Set `title_bar` in `[window]`; it works in sidecar and static apps alike.
+
+| Mode | What you get |
+| --- | --- |
+| `native` (default) | The OS title bar. `bar_color` sets its colour on Windows 11 and macOS; `theme` picks light or dark |
+| `custom` | No OS title bar: your HTML draws the whole bar, buttons included |
+| `overlay` | macOS: the page runs under a transparent title bar that keeps the traffic-light buttons. Same as `custom` on Windows and Linux |
+
+With `custom` or `overlay`, Porthole injects a small window-control API
+before your page's scripts run:
+
+```js
+window.porthole.window.minimize()
+window.porthole.window.toggleMaximize()
+window.porthole.window.close()
+window.porthole.window.isMaximized()                 // Promise<boolean>
+window.porthole.window.on('maximized-change', cb)    // returns an unsubscribe function
+window.porthole.window.titleBar                      // "custom" or "overlay" (macOS only)
+```
+
+Any element with a `data-porthole-drag` attribute moves the window when
+dragged, and maximises it on double-click, like an OS title bar. Buttons,
+links, inputs and anything marked `data-porthole-no-drag` inside it keep
+their clicks. While the window is maximised, `<html>` has a
+`data-porthole-maximized` attribute, handy for swapping the maximise icon.
+[`examples/hello-titlebar`](examples/hello-titlebar) has a starter bar
+(`titlebar.css` and `titlebar.js`) to copy.
+
+This is a fixed set of window messages, not a bridge between your page and
+native code: your backend's HTTP API stays the only interface, and the
+launcher ignores messages from any origin other than the app's own.
+
+- Frameless windows stay resizable from their edges: natively on Windows,
+  and through the page's outer 5 pixels on Linux (where the webview covers
+  the window's edges).
+- On Windows 11, a custom bar loses the snap-layout flyout of the maximise
+  button; Win+Z and dragging to the screen edges still work.
+- `bar_color` has no effect on Linux, where the desktop theme draws the bar.
+
+## Links, downloads and icons
+
+- **Links to other sites** open in the default browser, whether they are
+  plain links, `target="_blank"` or `window.open`; the window stays on the
+  app. Same-origin links load in the window.
+- **Downloads** (a link with `download`, or a response with
+  `Content-Disposition: attachment`) show the native "Save as" dialog,
+  starting in the user's Downloads folder.
+- **`<input type="file">`** uses each webview's native file picker.
+- **`app.icon`** (a PNG up to 1024 × 1024) is the window and taskbar icon
+  on Windows and Linux, and the Dock icon of a `--macos-app` bundle. The
+  icon Windows Explorer shows for the `.exe` file itself is not set.
+- **WebView2** ships with Windows 11 but is missing on some Windows 10
+  machines. Porthole checks for it at launch and, if it is missing, offers
+  to open Microsoft's download page.
 
 ## Auth handshake
 
@@ -295,8 +454,38 @@ npm run dev                                   # e.g. Vite on http://localhost:51
 porthole run --url http://localhost:5173
 ```
 
-`--url` also accepts `localhost:5173` or just `5173`. This is the workflow
-for frontend hot reload during development.
+`--url` also accepts `localhost:5173` or just `5173`.
+
+### Develop with hot reload
+
+For frontend work, run your dev server as usual and open a Porthole window
+on it, so you see the real webview (WebKit on macOS and Linux, Chromium on
+Windows) with hot reload:
+
+```sh
+npx vite --port 5173 --strictPort      # in one terminal
+porthole run --url 5173 --devtools      # in another
+```
+
+For a sidecar app, run the backend on its own in standalone mode (the
+examples take `--standalone`, so no token is needed) and let the dev
+server proxy API calls to it:
+
+```js
+// vite.config.js
+export default {
+  server: { proxy: { '/api': 'http://127.0.0.1:8000' } },
+};
+```
+
+```sh
+APP_PORT=8000 python3 server.py --standalone   # or: node server.js --standalone
+```
+
+When the frontend is ready, build it into the folder your backend serves
+(or `static.root`), and check the real thing with `porthole run app.toml`
+before packing. The window-control API for custom title bars only exists
+in app windows (`run app.toml` and packed apps), not with `--url`.
 
 | Flag | Default | Meaning |
 | --- | --- | --- |
@@ -314,8 +503,10 @@ Behaviour worth knowing:
 - **Loopback only by default.** URLs must point at `localhost`,
   `*.localhost`, `127.0.0.0/8` or `::1` unless you pass `--allow-remote`.
 - **One window.** Links with `target="_blank"` and `window.open` load in the
-  same window when they stay on the app's origin. Links to other sites open
-  in your default browser.
+  same window when they stay on the server's origin, and open in your
+  default browser when they go elsewhere. (Plain links are left alone
+  here, so a dev server can redirect or link wherever it likes; app windows
+  send those to the browser too.)
 - **Waits for the server.** Porthole retries the connection every 50 ms
   until `--wait` runs out, so you can start the server and Porthole together.
 - **macOS menus.** Porthole installs the standard App, Edit and Window menus
@@ -337,11 +528,30 @@ Platform requirements, at build time and on the user's machine:
 | macOS 11+ | WKWebView | Nothing extra |
 | Linux | WebKitGTK | `libwebkit2gtk-4.1` and GTK 3. To build on Debian/Ubuntu: `sudo apt install libwebkit2gtk-4.1-dev libgtk-3-dev` |
 
-CI builds and tests on Ubuntu 24.04, macOS (arm64) and Windows, including
-a test that kills a stand-in launcher outright and checks its sidecar dies
-with it, and runs window smoke tests on Linux under Xvfb, including one
-that checks a real webview completes the auth handshake. The sidecar tests
-use Python, and skip themselves where it is not installed.
+On Linux, users need the WebKitGTK 4.1 runtime, which most desktop
+distributions install with GNOME. If not: `sudo apt install
+libwebkit2gtk-4.1-0` (Debian 12+, Ubuntu 22.04+), `sudo dnf install
+webkit2gtk4.1` (Fedora 37+), or `sudo pacman -S webkit2gtk-4.1` (Arch).
+The released Linux launcher is built on Ubuntu 22.04, so it runs on
+distributions with glibc 2.35 or newer. CI tests on Ubuntu 22.04 (release
+build) and 24.04.
+
+CI builds and tests on Ubuntu 24.04, macOS (arm64) and Windows. On Linux it
+runs real windows under Xvfb (on a private D-Bus session bus) and waits for
+each page to load: `run --url`, sidecar and static apps, packed apps, the
+custom title bar's window controls, and the auth handshake in a real
+webview for the Express, FastAPI and Go examples. It also checks the
+startup budget (window visible within 300 ms of launch on a cache hit, not
+counting the backend's own start-up), cross-packs for Windows and macOS
+from Linux, then runs the Windows exe after Authenticode-signing it and the
+macOS bundle after codesigning it.
+
+### Releases
+
+Pushing a tag such as `v0.5.0` (matching `version` in `Cargo.toml`) runs
+the release workflow: it builds the launchers for the four targets in
+[Cross-packing](#cross-packing), and publishes them on a GitHub release with
+`SHA256SUMS`. That is where `pack --target` downloads from.
 
 ## Roadmap
 
@@ -352,8 +562,13 @@ use Python, and skip themselves where it is not installed.
    (or a static site, served from memory) inside.
 4. **v0.4 — Auth kit.** The [handshake spec](#auth-handshake), reference
    middlewares for Express and FastAPI/Starlette, and a conformance test.
-5. **v0.5 — Release polish.** Title bar modes, downloads, signing,
-   cross-packing, prebuilt launchers.
+5. **v0.5 — Release polish.** Title bar modes and window controls, window
+   icons, downloads, a stable sidecar port, Windows apps without a
+   console, signing support, `.app` bundles, cross-packing from prebuilt
+   release launchers, a Go example, and a startup budget in CI.
+6. **v1.0** once the packed format is frozen. After that: static + sidecar
+   proxy mode, file associations and deep links, tray icon, auto-update,
+   multiple windows.
 
 ## Licence
 

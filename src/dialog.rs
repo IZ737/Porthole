@@ -94,6 +94,37 @@ pub fn show_error(report: &ErrorReport) {
     }
 }
 
+/// Where Windows users get the WebView2 Runtime (Microsoft's Evergreen
+/// bootstrapper).
+#[cfg_attr(not(windows), allow(dead_code))]
+pub const WEBVIEW2_DOWNLOAD: &str = "https://go.microsoft.com/fwlink/p/?LinkId=2124703";
+
+/// Tell the user the OS webview is missing (Windows without the WebView2
+/// Runtime) and offer to open the download page.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn webview_missing(app: &str, detail: &str) {
+    let message = format!(
+        "{app} needs the Microsoft Edge WebView2 Runtime, which is not installed on this computer ({detail})."
+    );
+    logs::write("ERROR", &message);
+    if std::env::var_os(NO_DIALOGS_ENV).is_some() {
+        return;
+    }
+    let result = MessageDialog::new()
+        .set_level(MessageLevel::Error)
+        .set_title(app)
+        .set_description(format!(
+            "{message}\n\nDownload it from Microsoft now? Start {app} again once it is installed."
+        ))
+        .set_buttons(MessageButtons::YesNo)
+        .show();
+    if result == MessageDialogResult::Yes
+        && let Err(err) = open::that_detached(WEBVIEW2_DOWNLOAD)
+    {
+        logs::warning!("could not open {WEBVIEW2_DOWNLOAD}: {err}");
+    }
+}
+
 fn open_folder(dir: &Path) {
     if let Err(err) = open::that_detached(dir) {
         logs::warning!("could not open {}: {err}", dir.display());

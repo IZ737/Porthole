@@ -17,7 +17,7 @@ use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
-use std::time::{Instant, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Context, Result};
 use url::Url;
@@ -25,6 +25,7 @@ use url::Url;
 use crate::cache;
 use crate::config::{self, Config, Mode, SidecarSection, StaticSection};
 use crate::dialog::{self, ErrorReport};
+use crate::icon;
 use crate::instance::{self, Instance, Primary};
 use crate::logs;
 use crate::payload::{Footer, PackInfo, Payload};
@@ -59,6 +60,7 @@ struct Bundle {
     footer: Footer,
     info: PackInfo,
     cache_root: PathBuf,
+    icon: Option<Vec<u8>>,
 }
 
 impl Bundle {
@@ -112,7 +114,7 @@ pub fn run_dev(config_path: &Path, opts: RunOptions) -> Result<()> {
 /// A packed exe: everything comes from the payload at the end of `exe`.
 pub fn run_packed(exe: PathBuf, footer: Footer, opts: RunOptions) -> Result<()> {
     let payload = Payload::new(&exe, &footer);
-    let (app_toml, info) = payload.read_meta()?;
+    let (app_toml, info, icon) = payload.read_meta_and_icon()?;
     let cache_root = cache::root()?;
     // Paths in the packed app.toml point into the cache folder.
     let config = Config::parse(&app_toml, &cache::folder(&cache_root, &footer))
@@ -128,6 +130,7 @@ pub fn run_packed(exe: PathBuf, footer: Footer, opts: RunOptions) -> Result<()> 
         footer,
         info,
         cache_root,
+        icon,
     };
     launch(config, &label, Some(bundle), opts)
 }
@@ -186,7 +189,8 @@ fn launch(config: Config, label: &str, bundle: Option<Bundle>, opts: RunOptions)
     if let Some(b) = &bundle {
         b.prune_in_background();
     }
-    let window_opts = window_options(&config, &data_dir, opts.devtools);
+    let mut window_opts = window_options(&config, &data_dir, opts.devtools);
+    window_opts.icon = window_icon(&config, bundle.as_ref());
     match &config.mode {
         Mode::Sidecar(sc) => {
             if let Some(b) = &bundle
@@ -245,6 +249,37 @@ fn window_options(config: &Config, data_dir: &Path, devtools: bool) -> WindowOpt
             .then(|| data_dir.join(window_state::FILE_NAME)),
         webview_data_dir: Some(data_dir.join("webview")),
         protocol: None,
+        title_bar: config.window.title_bar,
+        bar_color: config.window.bar_rgb(),
+        icon: None,
+        app_page: true,
+        startup_wait: Duration::ZERO,
+    }
+}
+
+/// The window icon from `app.icon`: the payload's copy in a packed app,
+/// the file next to `app.toml` in development. A bad icon is only a
+/// warning.
+fn window_icon(config: &Config, bundle: Option<&Bundle>) -> Option<tao::window::Icon> {
+    let bytes = match bundle {
+        Some(b) => b.icon.clone()?,
+        None => {
+            let path = config.icon_path.as_ref()?;
+            match std::fs::read(path) {
+                Ok(b) => b,
+                Err(err) => {
+                    logs::warning!("could not read `app.icon` {}: {err}", path.display());
+                    return None;
+                }
+            }
+        }
+    };
+    match icon::window_icon(&bytes) {
+        Ok(i) => Some(i),
+        Err(err) => {
+            logs::warning!("`app.icon` can't be used as the window icon: {err:#}");
+            None
+        }
     }
 }
 
@@ -279,7 +314,7 @@ fn run_sidecar(
     data_dir: &Path,
     logs_dir: &Path,
     instance: Option<Primary>,
-    window_opts: WindowOptions,
+    mut window_opts: WindowOptions,
     fail: &dyn Fn(String, Vec<String>) -> anyhow::Error,
 ) -> Result<()> {
     // Spawn on the main thread: see `Sidecar::spawn` about Linux's
@@ -305,9 +340,10 @@ fn run_sidecar(
         sidecar.shutdown();
         return Err(fail(format!("{err:#}"), sidecar.log_tail()));
     }
+    window_opts.startup_wait = started.elapsed();
     logs::info!(
         "backend ready after {:.2}s",
-        started.elapsed().as_secs_f64()
+        window_opts.startup_wait.as_secs_f64()
     );
 
     let url = app_url(port, token.as_deref())?;
@@ -349,7 +385,7 @@ fn sidecar_spec(
     logs_dir: &Path,
 ) -> Result<(sidecar::Spec, u16, Option<String>)> {
     let (program, cwd) = sidecar::resolve_program(&sc.path, sc.command.as_deref())?;
-    let port = sidecar::pick_port().context("could not find a free port")?;
+    let port = sidecar::pick_port_for(data_dir).context("could not find a free port")?;
     let token = if config.auth.enabled {
         Some(sidecar::random_hex(32)?)
     } else {

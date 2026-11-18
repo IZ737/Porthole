@@ -100,6 +100,18 @@ pub fn timestamp() -> String {
 }
 
 static LAUNCHER_LOG: OnceLock<Mutex<RotatingFile>> = OnceLock::new();
+static START: OnceLock<std::time::Instant> = OnceLock::new();
+
+/// Note when the process started, for [`since_start`]. Call first thing in
+/// `main`.
+pub fn mark_start() {
+    let _ = START.set(std::time::Instant::now());
+}
+
+/// Time since [`mark_start`].
+pub fn since_start() -> std::time::Duration {
+    START.get().map(|s| s.elapsed()).unwrap_or_default()
+}
 static CONSOLE: AtomicBool = AtomicBool::new(false);
 
 /// Send launcher messages to `<logs_dir>/porthole.log` from now on, and

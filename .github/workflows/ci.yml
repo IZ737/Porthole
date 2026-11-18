@@ -54,115 +54,130 @@ jobs:
       - name: Build release
         run: cargo build --release --locked
 
-      # Opens a real window on a local server under a virtual display and
-      # checks the launcher is still running (no crash) after a few seconds.
-      - name: Smoke test (Linux)
+      # The window tests below run under a private session bus: on the
+      # runner, GLib otherwise finds the systemd user bus in
+      # $XDG_RUNTIME_DIR and hangs authenticating to it, and WebKit never
+      # starts its web process (no page loads). Each test waits for proof
+      # that the page actually loaded, not just that the process is alive.
+      - name: Smoke test, run --url (Linux)
         if: runner.os == 'Linux'
         run: |
           mkdir -p /tmp/site
           echo '<!doctype html><title>smoke</title><h1>ok</h1>' > /tmp/site/index.html
-          python3 -m http.server 8765 --bind 127.0.0.1 -d /tmp/site &
-          xvfb-run -a bash -c '
-            ./target/release/porthole run --url 8765 & pid=$!
-            sleep 5
-            kill -0 $pid || { echo "porthole exited early"; exit 1; }
+          python3 -m http.server 8765 --bind 127.0.0.1 -d /tmp/site 2> /tmp/http.log &
+          dbus-run-session -- xvfb-run -a bash -c '
+            ./target/release/porthole run --url 8765 2> /tmp/url.log & pid=$!
+            ci/wait-for.sh $pid /tmp/url.log "page loaded: http://localhost:8765/"
             kill $pid
           '
+          grep -q '"GET / HTTP' /tmp/http.log
 
-      # Starts the example sidecar app, checks the backend is up, then
-      # SIGKILLs the launcher and checks the backend went with it.
+      # Starts the example sidecar app and waits for its page, checks the
+      # port is the same on the next launch (so browser storage survives),
+      # then SIGKILLs the launcher and checks the backend went with it.
       - name: Smoke test, sidecar (Linux)
         if: runner.os == 'Linux'
         env:
           PORTHOLE_NO_DIALOGS: '1'
         run: |
-          xvfb-run -a bash -c '
-            ./target/release/porthole run examples/hello-python/app.toml --console & pid=$!
-            sleep 5
-            kill -0 $pid || { echo "porthole exited early"; exit 1; }
+          export XDG_DATA_HOME=$(mktemp -d)
+          log=$XDG_DATA_HOME/dev.porthole.hello-python/logs/porthole.log
+          dbus-run-session -- xvfb-run -a bash -c '
+            set -e
+            ./target/release/porthole run examples/hello-python/app.toml & pid=$!
+            ci/wait-for.sh $pid '"$log"' "page loaded: http://127.0.0.1:[0-9]+/$"
             pgrep -x -f "python3 server.py" || { echo "backend is not running"; exit 1; }
             kill -9 $pid
             sleep 2
             if pgrep -x -f "python3 server.py"; then echo "backend outlived porthole"; exit 1; fi
+            first=$(grep -o "on port [0-9]*" '"$log"')
+            rm '"$log"'
+            ./target/release/porthole run examples/hello-python/app.toml & pid=$!
+            ci/wait-for.sh $pid '"$log"' "page loaded"
+            kill $pid; wait $pid || true
+            second=$(grep -o "on port [0-9]*" '"$log"')
+            echo "first launch: $first, second: $second"
+            [ "$first" = "$second" ]
           '
 
-      # Packs both examples, checks `inspect`, and runs the packed sidecar
-      # app (it must unpack, start its backend, and take the backend down
-      # when killed) and the packed static app.
+      # Packs the examples, checks `inspect`, and runs the packed sidecar
+      # app (it must unpack, start its backend, load its page, and take the
+      # backend down when killed), the packed static app, and the custom
+      # title bar example (its page must reach the window controls).
       - name: Smoke test, packed apps (Linux)
         if: runner.os == 'Linux'
         env:
           PORTHOLE_NO_DIALOGS: '1'
           PORTHOLE_CACHE_DIR: /tmp/porthole-cache
         run: |
+          export XDG_DATA_HOME=$(mktemp -d)
           ./target/release/porthole pack examples/hello-python/app.toml -o /tmp/HelloPython
           ./target/release/porthole pack examples/hello-static/app.toml -o /tmp/HelloStatic
+          ./target/release/porthole pack examples/hello-titlebar/app.toml -o /tmp/HelloTitleBar
           ./target/release/porthole inspect /tmp/HelloPython | grep -q 'sha256.*(matches)'
           ./target/release/porthole inspect /tmp/HelloStatic | grep -q 'served from memory'
-          xvfb-run -a bash -c '
-            /tmp/HelloPython --console & pid=$!
-            sleep 5
-            kill -0 $pid || { echo "packed app exited early"; exit 1; }
+          dbus-run-session -- xvfb-run -a bash -c '
+            set -e
+            logs=$XDG_DATA_HOME
+            /tmp/HelloPython & pid=$!
+            ci/wait-for.sh $pid $logs/dev.porthole.hello-python/logs/porthole.log "page loaded"
             pgrep -x -f "python3 server.py" || { echo "backend is not running"; exit 1; }
             ls /tmp/porthole-cache/*/.complete || { echo "no cache folder"; exit 1; }
             kill -9 $pid
             sleep 2
             if pgrep -x -f "python3 server.py"; then echo "backend outlived porthole"; exit 1; fi
-          '
-          xvfb-run -a bash -c '
-            /tmp/HelloStatic --console > /tmp/static.log 2>&1 & pid=$!
-            sleep 5
-            cat /tmp/static.log
-            kill -0 $pid || { echo "packed static app exited early"; exit 1; }
+
+            /tmp/HelloStatic & pid=$!
+            log=$logs/dev.porthole.hello-static/logs/porthole.log
+            ci/wait-for.sh $pid $log "page loaded: porthole://localhost/"
             kill $pid
-            grep -q "loaded .* files into memory" /tmp/static.log
-            if grep -q "no file for" /tmp/static.log; then echo "a page asset 404ed"; exit 1; fi
+            grep -q "loaded .* files into memory" $log
+            if grep -q "no file for" $log; then echo "a page asset 404ed"; exit 1; fi
+
+            /tmp/HelloTitleBar & pid=$!
+            ci/wait-for.sh $pid $logs/dev.porthole.hello-titlebar/logs/porthole.log "window control: is-maximized"
+            kill $pid
           '
 
-      # Launches the Express and FastAPI examples in a real webview and
-      # checks the page's own API call gets through the auth handshake
-      # (302, HttpOnly cookie, cookie sent on fetch).
-      # Launches the Express and FastAPI examples in a real webview and
-      # checks the page's own API call gets through the auth handshake
-      # (302, HttpOnly cookie, cookie sent on fetch).
-      # TEMPORARY: find out why the page doesn't load on the runner.
-      - name: Webview diagnostics (Linux)
+      # Window visible within 300 ms of launch on a cache hit, not counting
+      # the time the backend itself takes to start.
+      - name: Startup budget (Linux)
         if: runner.os == 'Linux'
-        continue-on-error: true
+        env:
+          PORTHOLE_NO_DIALOGS: '1'
+          PORTHOLE_CACHE_DIR: /tmp/porthole-cache
         run: |
-          sysctl kernel.apparmor_restrict_unprivileged_userns kernel.unprivileged_userns_clone user.max_user_namespaces || true
-          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
-          bwrap --ro-bind / / true && echo "bwrap ok" || echo "bwrap FAILED"
-          (cd examples/hello-express && npm ci --install-links)
-          echo "DBUS_SESSION_BUS_ADDRESS=${DBUS_SESSION_BUS_ADDRESS-unset} XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR-unset}"
-          try() {
-            echo "=== $*"
-            "$@" bash -c '
-              export XDG_DATA_HOME=$(mktemp -d) PORTHOLE_NO_DIALOGS=1
-              echo "bus: ${DBUS_SESSION_BUS_ADDRESS-unset}"
-              ./target/release/porthole run examples/hello-express/app.toml --console > /tmp/ph.log 2>&1 & pid=$!
-              sleep 8
-              ps -eo pid,args | grep -i -E "webkit|bwrap|dbus" | grep -v grep
-              sudo gdb -p $pid -batch -ex "thread apply all bt 12" 2>/dev/null | grep -E "^#|^Thread" | head -60
-              kill $pid; sleep 1
-              grep -v "^$" /tmp/ph.log | grep -v -i "a11y" | tail -15
-            '
-          }
-          try xvfb-run -a
-          try env -u DBUS_SESSION_BUS_ADDRESS xvfb-run -a
-          try dbus-run-session -- xvfb-run -a
+          export XDG_DATA_HOME=$(mktemp -d)
+          dbus-run-session -- xvfb-run -a bash -c '
+            set -e
+            ci/startup-budget.sh /tmp/HelloStatic dev.porthole.hello-static 300
+            ci/startup-budget.sh /tmp/HelloPython dev.porthole.hello-python 300
+          '
 
+      # Launches the Express, FastAPI and Go examples in a real webview and
+      # checks the page's own API call gets through the auth handshake
+      # (302, HttpOnly cookie, cookie sent on fetch).
       - name: Auth kit in a webview (Linux)
         if: runner.os == 'Linux'
         run: |
           (cd examples/hello-express && npm ci --install-links)
           # requirements.txt paths are relative to the folder pip runs in.
           (cd examples/hello-fastapi && python3 -m pip install --user --break-system-packages -r requirements.txt)
-          # A private session bus: on the runner, GLib otherwise finds the
-          # systemd user bus in $XDG_RUNTIME_DIR and hangs authenticating to
-          # it, and WebKit never starts its web process (no page loads).
-          dbus-run-session -- xvfb-run -a auth-kit/webview-e2e.sh ./target/release/porthole examples/hello-express/app.toml dev.porthole.hello-express
-          dbus-run-session -- xvfb-run -a auth-kit/webview-e2e.sh ./target/release/porthole examples/hello-fastapi/app.toml dev.porthole.hello-fastapi
+          (cd examples/hello-go && go build -o bin/ .)
+          for app in express fastapi go; do
+            dbus-run-session -- xvfb-run -a auth-kit/webview-e2e.sh ./target/release/porthole examples/hello-$app/app.toml dev.porthole.hello-$app
+          done
+
+      # A plain packed exe (payload appended to the Mach-O) must still run.
+      - name: Smoke test, packed app (macOS)
+        if: runner.os == 'macOS'
+        env:
+          PORTHOLE_NO_DIALOGS: '1'
+        run: |
+          ./target/release/porthole pack examples/hello-static/app.toml -o /tmp/HelloStatic
+          /tmp/HelloStatic & pid=$!
+          ci/wait-for.sh $pid "$HOME/Library/Application Support/dev.porthole.hello-static/logs/porthole.log" "page loaded" 30
+          kill $pid
 
       - uses: actions/upload-artifact@v4
         with:
@@ -195,8 +210,14 @@ jobs:
         with:
           python-version: '3.12'
 
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          cache: false
+
       - name: Install
         run: |
+          (cd examples/hello-go && go build -o bin/ .)
           (cd auth-kit/node && npm ci)
           (cd examples/hello-express && npm ci --install-links)
           python -m pip install -e 'auth-kit/python[test]'
@@ -221,3 +242,121 @@ jobs:
           $c python examples/hello-python/server.py
           $c node examples/hello-express/server.js
           $c python examples/hello-fastapi/server.py
+          $c examples/hello-go/bin/hello-go
+
+  # Packs on Linux for Windows and macOS, downloading the launchers from a
+  # stand-in for a GitHub release built from this run's binaries (so
+  # `pack --target` is tested end to end, SHA256SUMS included).
+  cross-pack:
+    name: Cross-pack from Linux
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: porthole-*
+          path: artifacts
+
+      - name: Cross-pack from a local release
+        env:
+          PORTHOLE_CACHE_DIR: /tmp/porthole-cache
+        run: |
+          chmod +x artifacts/*/porthole*
+          ver=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          rel=/tmp/release/v$ver
+          mkdir -p $rel out
+          cp artifacts/porthole-Windows-X64/porthole.exe $rel/porthole-$ver-x86_64-pc-windows-msvc.exe
+          cp artifacts/porthole-macOS-ARM64/porthole $rel/porthole-$ver-aarch64-apple-darwin
+          (cd $rel && sha256sum porthole-* > SHA256SUMS)
+          python3 -m http.server 8770 --bind 127.0.0.1 -d /tmp/release & server=$!
+          sleep 1
+          export PORTHOLE_RELEASES_URL=http://127.0.0.1:8770
+          p=artifacts/porthole-Linux-X64/porthole
+          $p pack examples/hello-titlebar/app.toml --target x86_64-pc-windows-msvc -o out/HelloTitleBar.exe
+          $p inspect out/HelloTitleBar.exe | tee /tmp/inspect.txt
+          grep -q "Windows x86_64, GUI subsystem" /tmp/inspect.txt
+          $p pack examples/hello-titlebar/app.toml --target aarch64-apple-darwin --macos-app -o out/HelloTitleBar.app
+          $p inspect out/HelloTitleBar.app | tee /tmp/inspect.txt
+          grep -q "macOS aarch64" /tmp/inspect.txt
+          test -f out/HelloTitleBar.app/Contents/Resources/AppIcon.icns
+          # The launchers are cached: no server needed the second time.
+          kill $server
+          $p pack examples/hello-static/app.toml --target x86_64-pc-windows-msvc -o out/HelloStatic.exe
+          # A launcher for the wrong platform is refused.
+          if $p pack examples/hello-static/app.toml --target x86_64-pc-windows-msvc \
+               --launcher artifacts/porthole-macOS-ARM64/porthole -o out/x.exe; then
+            echo "packed onto the wrong launcher"; exit 1
+          fi
+          # Keep the bundle's permissions through the artifact upload.
+          tar -C out -cf cross-packed.tar .
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cross-packed
+          path: cross-packed.tar
+
+  # Runs what cross-pack made: on Windows after signing it (the launcher
+  # must find its payload in front of the certificate table), on macOS
+  # after codesigning the bundle.
+  cross-run:
+    name: Run cross-packed (${{ matrix.os }})
+    needs: cross-pack
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    env:
+      PORTHOLE_NO_DIALOGS: '1'
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: cross-packed
+
+      - name: Unpack
+        run: mkdir out && tar -C out -xf cross-packed.tar
+
+      - name: Sign (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $cert = New-SelfSignedCertificate -Type CodeSigningCert -Subject "CN=Porthole CI" -CertStoreLocation Cert:\CurrentUser\My
+          $before = (Get-Item out\HelloTitleBar.exe).Length
+          Set-AuthenticodeSignature -FilePath out\HelloTitleBar.exe -Certificate $cert -HashAlgorithm SHA256 | Format-List
+          $sig = Get-AuthenticodeSignature out\HelloTitleBar.exe
+          if ($null -eq $sig.SignerCertificate) { throw "not signed" }
+          "signed: $before -> $((Get-Item out\HelloTitleBar.exe).Length) bytes"
+
+      - uses: actions/download-artifact@v4
+        if: runner.os == 'Windows'
+        with:
+          name: porthole-Windows-X64
+          path: bin
+
+      - name: Inspect and run (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          bin/porthole.exe inspect out/HelloTitleBar.exe | tee inspect.txt
+          grep -q "signature *Authenticode" inspect.txt
+          grep -q "sha256.*(matches)" inspect.txt
+          out/HelloTitleBar.exe & pid=$!
+          log="$(cygpath "$APPDATA")/dev.porthole.hello-titlebar/logs/porthole.log"
+          ci/wait-for.sh $pid "$log" "window control: is-maximized" 60
+          kill $pid
+
+      - name: Sign, check and run (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          app=out/HelloTitleBar.app
+          codesign --force --deep --sign - "$app"
+          codesign --verify --deep --strict --verbose=2 "$app"
+          "$app/Contents/MacOS/Hello Title Bar" & pid=$!
+          ci/wait-for.sh $pid "$HOME/Library/Application Support/dev.porthole.hello-titlebar/logs/porthole.log" "window control: is-maximized" 60
+          kill $pid

@@ -1,0 +1,89 @@
+/* Starter title bar for `title_bar = "custom"` (or "overlay"). Change the
+   colours and height freely; the rest is what makes it behave like an OS
+   title bar. */
+:root {
+  --titlebar-height: 36px;
+  --titlebar-bg: #1e1e2e;
+  --titlebar-fg: #cdd6f4;
+  --titlebar-hover: rgba(255, 255, 255, 0.1);
+  --titlebar-close-hover: #e81123;
+}
+
+.titlebar {
+  position: fixed;
+  inset: 0 0 auto 0;
+  height: var(--titlebar-height);
+  display: flex;
+  align-items: center;
+  background: var(--titlebar-bg);
+  color: var(--titlebar-fg);
+  font: 13px system-ui, sans-serif;
+  user-select: none;
+  -webkit-user-select: none;
+  cursor: default;
+  z-index: 1000;
+}
+
+.titlebar-title {
+  flex: 1;
+  padding-left: 12px;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.titlebar-buttons {
+  display: flex;
+  height: 100%;
+}
+
+.titlebar-buttons button {
+  width: 46px;
+  height: 100%;
+  border: 0;
+  padding: 0;
+  background: transparent;
+  color: inherit;
+  display: grid;
+  place-items: center;
+}
+
+.titlebar-buttons button:hover {
+  background: var(--titlebar-hover);
+}
+
+.titlebar-buttons button.close:hover {
+  background: var(--titlebar-close-hover);
+  color: #fff;
+}
+
+.titlebar-buttons svg {
+  width: 10px;
+  height: 10px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1;
+}
+
+/* Porthole sets data-porthole-maximized on <html> while maximised. */
+.when-maximized,
+[data-porthole-maximized] .when-normal {
+  display: none;
+}
+[data-porthole-maximized] .when-maximized {
+  display: block;
+}
+
+/* Overlay mode (macOS only): the OS keeps its traffic-light buttons at
+   the top left, so leave room for them and hide the drawn ones. */
+html.titlebar-overlay .titlebar-title {
+  padding-left: 78px;
+}
+html.titlebar-overlay .titlebar-buttons {
+  display: none;
+}
+
+body {
+  margin: 0;
+  padding-top: var(--titlebar-height);
+}

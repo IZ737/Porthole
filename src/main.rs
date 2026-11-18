@@ -10,7 +10,9 @@
 //!   together.
 //! - [`payload`]: the packed format (footer and tar.zst payload), and
 //!   self-detection: an exe with a footer runs its app instead of the CLI.
-//! - [`pack`]: `pack` and `inspect`.
+//! - [`pack`]: `pack` and `inspect`, including cross-packing from
+//!   downloaded launchers ([`launcher`]) and macOS `.app` bundles
+//!   ([`macos_app`]). [`exe`]: the PE / Mach-O / ELF details packing needs.
 //! - [`cache`]: the extract-once cache for packed apps.
 //! - [`static_site`]: static mode's `porthole://` file server.
 //! - [`config`]: parsing and validating `app.toml`.
@@ -19,7 +21,9 @@
 //! - [`logs`]: rotating log files and `--console`.
 //! - [`dialog`]: native error dialogs.
 //! - [`window`] and [`window_state`]: the tao window and wry webview, and
-//!   remembering its bounds. Every mode ends by handing a URL and
+//!   remembering its bounds. [`window_api`]: the script injected into app
+//!   pages and the window controls for custom title bars. [`icon`]: PNG
+//!   decoding for `app.icon`. Every mode ends by handing a URL and
 //!   [`window::WindowOptions`] to [`window::open`].
 
 mod app;
@@ -27,8 +31,12 @@ mod cache;
 mod cli;
 mod config;
 mod dialog;
+mod exe;
+mod icon;
 mod instance;
+mod launcher;
 mod logs;
+mod macos_app;
 mod pack;
 mod payload;
 mod ready;
@@ -36,6 +44,7 @@ mod sidecar;
 mod static_site;
 mod target;
 mod window;
+mod window_api;
 mod window_state;
 
 use std::process::ExitCode;
@@ -47,6 +56,7 @@ use crate::cli::{Cli, Command, PackedArgs, RunArgs};
 use crate::dialog::ErrorReport;
 
 fn main() -> ExitCode {
+    logs::mark_start();
     // A packed exe runs its app; a plain one is the developer CLI.
     match detect_payload() {
         Ok(None) => {}
@@ -72,6 +82,9 @@ fn main() -> ExitCode {
             pack::PackOptions {
                 output: args.output,
                 devtools: args.devtools,
+                target: args.target,
+                launcher: args.launcher,
+                macos_app: args.macos_app,
             },
         ),
         Command::Inspect(args) => pack::inspect(&args.exe),
@@ -85,10 +98,18 @@ fn main() -> ExitCode {
     }
 }
 
-/// This executable and its payload footer, if it has one.
+/// The file holding this app's payload, and its footer: this executable,
+/// or the payload file of the `.app` bundle it runs in. `None` for the
+/// plain CLI.
 fn detect_payload() -> Result<Option<(std::path::PathBuf, payload::Footer)>> {
     let exe = std::env::current_exe()?;
-    Ok(payload::read_footer(&exe)?.map(|f| (exe, f)))
+    if let Some(footer) = payload::read_footer(&exe)? {
+        return Ok(Some((exe, footer)));
+    }
+    if let Some(file) = macos_app::payload_for_exe(&exe) {
+        return Ok(payload::read_footer(&file)?.map(|f| (file, f)));
+    }
+    Ok(None)
 }
 
 fn run_packed(exe: std::path::PathBuf, footer: payload::Footer) -> ExitCode {
@@ -146,6 +167,11 @@ fn run_url(args: RunArgs) -> Result<()> {
             state_file: None,
             webview_data_dir: None,
             protocol: None,
+            title_bar: config::TitleBar::Native,
+            bar_color: None,
+            icon: None,
+            app_page: false,
+            startup_wait: std::time::Duration::ZERO,
         },
         window::Hooks::default(),
     )

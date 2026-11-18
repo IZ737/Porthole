@@ -1,0 +1,20 @@
+# A static app that draws its own title bar in HTML. Copy `web/titlebar.css`
+# and `web/titlebar.js` into your app as a starting point.
+#
+#   porthole run examples/hello-titlebar/app.toml
+#
+# `title_bar = "overlay"` keeps the macOS traffic lights and runs the page
+# under a transparent bar; on Windows and Linux it is the same as "custom".
+
+[app]
+name = "Hello Title Bar"
+id = "dev.porthole.hello-titlebar"
+icon = "icon.png"
+
+[window]
+width = 900
+height = 600
+title_bar = "custom"
+
+[static]
+root = "web/"

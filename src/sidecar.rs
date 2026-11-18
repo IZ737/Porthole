@@ -104,6 +104,40 @@ pub fn pick_port() -> io::Result<u16> {
     Ok(listener.local_addr()?.port())
 }
 
+/// Remembers the app's port in `APP_DATA_DIR`.
+pub const PORT_FILE: &str = "porthole-port";
+
+/// The app's port: the one it had last time if it is still free, so the
+/// page keeps its origin (`http://127.0.0.1:<port>`) and with it its
+/// localStorage, IndexedDB and other per-origin storage across launches.
+/// The first launch picks a random free port and remembers it.
+///
+/// If the remembered port is taken (by another program, or by a second
+/// window of an app with `single_instance = false`), this launch uses a
+/// random one, but the remembered port is kept for next time.
+pub fn pick_port_for(data_dir: &Path) -> io::Result<u16> {
+    let file = data_dir.join(PORT_FILE);
+    let saved = std::fs::read_to_string(&file)
+        .ok()
+        .and_then(|s| s.trim().parse::<u16>().ok())
+        .filter(|p| *p >= 1024);
+    if let Some(port) = saved {
+        if TcpListener::bind((Ipv4Addr::LOCALHOST, port)).is_ok() {
+            return Ok(port);
+        }
+        logs::warning!(
+            "port {port}, which this app used last time, is taken; using another one, \
+             so the page's saved browser storage is not available this time"
+        );
+        return pick_port();
+    }
+    let port = pick_port()?;
+    if let Err(err) = std::fs::write(&file, format!("{port}\n")) {
+        logs::warning!("could not save the port to {}: {err}", file.display());
+    }
+    Ok(port)
+}
+
 /// `bytes` random bytes from the OS, as lowercase hex.
 pub fn random_hex(bytes: usize) -> Result<String> {
     let mut buf = vec![0u8; bytes];
@@ -687,7 +721,8 @@ mod os {
         SetInformationJobObject, TerminateJobObject,
     };
     use windows_sys::Win32::System::Threading::{
-        CREATE_NEW_PROCESS_GROUP, CREATE_SUSPENDED, OpenThread, ResumeThread, THREAD_SUSPEND_RESUME,
+        CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW, CREATE_SUSPENDED, OpenThread, ResumeThread,
+        THREAD_SUSPEND_RESUME,
     };
 
     /// The job object holding the sidecar and everything it starts. When
@@ -736,7 +771,10 @@ mod os {
         };
         // Start suspended so the child is in the job before it can start
         // processes of its own, then resume it.
-        cmd.creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_SUSPENDED);
+        // CREATE_NO_WINDOW: a packed app is a GUI program with no console,
+        // so a console backend (python.exe, node.exe) would otherwise get
+        // a console window of its own. Its output is piped to the log.
+        cmd.creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_SUSPENDED | CREATE_NO_WINDOW);
         let mut child = cmd.spawn()?;
         if let Some(job) = job {
             // SAFETY: both handles are valid for the duration of the call.
@@ -845,6 +883,30 @@ mod tests {
         for s in [404, 500, 502, 503] {
             assert!(!is_ready_status(s), "{s}");
         }
+    }
+
+    #[test]
+    fn port_is_remembered() {
+        let dir = std::env::temp_dir().join(format!("porthole-port-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let first = pick_port_for(&dir).unwrap();
+        assert_eq!(pick_port_for(&dir).unwrap(), first);
+        assert_eq!(
+            std::fs::read_to_string(dir.join(PORT_FILE)).unwrap().trim(),
+            first.to_string()
+        );
+        // Taken: use another port this time, but keep the saved one.
+        let held = TcpListener::bind((Ipv4Addr::LOCALHOST, first)).unwrap();
+        assert_ne!(pick_port_for(&dir).unwrap(), first);
+        drop(held);
+        assert_eq!(pick_port_for(&dir).unwrap(), first);
+        // Garbage or a privileged port: start over.
+        std::fs::write(dir.join(PORT_FILE), "80").unwrap();
+        let fresh = pick_port_for(&dir).unwrap();
+        assert!(fresh >= 1024);
+        assert_eq!(pick_port_for(&dir).unwrap(), fresh);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

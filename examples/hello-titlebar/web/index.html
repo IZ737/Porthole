@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Hello Title Bar</title>
+  <link rel="stylesheet" href="titlebar.css">
+  <link rel="stylesheet" href="style.css">
+  <script type="module" src="titlebar.js"></script>
+  <script type="module" src="app.js"></script>
+</head>
+<body>
+  <!-- The starter title bar. Anything with data-porthole-drag moves the
+       window; buttons and links inside it keep their clicks. -->
+  <header class="titlebar" data-porthole-drag>
+    <span class="titlebar-title">Hello Title Bar</span>
+    <div class="titlebar-buttons">
+      <button type="button" data-window="minimize" aria-label="Minimise">
+        <svg viewBox="0 0 10 10" aria-hidden="true"><path d="M1 5h8"/></svg>
+      </button>
+      <button type="button" data-window="maximize" aria-label="Maximise">
+        <svg class="when-normal" viewBox="0 0 10 10" aria-hidden="true"><rect x="1.5" y="1.5" width="7" height="7"/></svg>
+        <svg class="when-maximized" viewBox="0 0 10 10" aria-hidden="true"><path d="M3 3V1.5h5.5V7H7M1.5 3h5.5v5.5H1.5z"/></svg>
+      </button>
+      <button type="button" data-window="close" class="close" aria-label="Close">
+        <svg viewBox="0 0 10 10" aria-hidden="true"><path d="M1.5 1.5l7 7M8.5 1.5l-7 7"/></svg>
+      </button>
+    </div>
+  </header>
+
+  <main>
+    <h1>A title bar drawn in HTML</h1>
+    <p>Drag the bar to move the window, double-click it to maximise. The
+      buttons call <code>window.porthole.window</code>.</p>
+    <p>The window is <strong id="state">…</strong>.</p>
+    <p><a href="https://github.com/IZ737/Porthole">Links to other sites</a>
+      open in your browser.</p>
+  </main>
+</body>
+</html>

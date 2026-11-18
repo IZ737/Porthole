@@ -1,0 +1,21 @@
+# A sidecar app with a Go backend (standard library only). Build it first:
+#
+#   (cd examples/hello-go && go build -o bin/ .)
+#   porthole run examples/hello-go/app.toml --console
+#   porthole pack examples/hello-go/app.toml     # one executable
+
+[app]
+name = "Hello Go"
+id = "dev.porthole.hello-go"
+
+[window]
+width = 900
+height = 600
+
+[sidecar]
+path = "bin/"
+command = "hello-go"
+ready_path = "/healthz"
+
+[sidecar.windows]
+command = "hello-go.exe"
