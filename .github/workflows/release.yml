@@ -22,8 +22,8 @@ env:
 jobs:
   build:
     name: ${{ matrix.name }}
-    # A job whose runner never shows up should fail the release, not sit in
-    # the queue for a day.
+    # Bounds a build that hangs once it has a runner. Time spent waiting in
+    # the queue doesn't count; GitHub drops a queued job after 24 hours.
     timeout-minutes: 45
     strategy:
       fail-fast: true
