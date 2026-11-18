@@ -887,26 +887,47 @@ mod tests {
 
     #[test]
     fn port_is_remembered() {
-        let dir = std::env::temp_dir().join(format!("porthole-port-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let first = pick_port_for(&dir).unwrap();
-        assert_eq!(pick_port_for(&dir).unwrap(), first);
+        // Other tests bind ephemeral ports at the same time, so the OS can
+        // hand a port this test has just released to one of them before
+        // the next call checks it. When that happens, start again with a
+        // new data folder (and so a new port) instead of failing.
+        for attempt in 0..5 {
+            let dir = std::env::temp_dir()
+                .join(format!("porthole-port-{}-{attempt}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            let result = check_port_memory(&dir);
+            let _ = std::fs::remove_dir_all(&dir);
+            if result {
+                return;
+            }
+        }
+        panic!("another test took the remembered port on every attempt");
+    }
+
+    /// The checks behind `port_is_remembered`. Returns false when a port
+    /// that should have been free was taken by someone else.
+    fn check_port_memory(dir: &Path) -> bool {
+        let first = pick_port_for(dir).unwrap();
+        if pick_port_for(dir).unwrap() != first {
+            return false;
+        }
         assert_eq!(
             std::fs::read_to_string(dir.join(PORT_FILE)).unwrap().trim(),
             first.to_string()
         );
         // Taken: use another port this time, but keep the saved one.
         let held = TcpListener::bind((Ipv4Addr::LOCALHOST, first)).unwrap();
-        assert_ne!(pick_port_for(&dir).unwrap(), first);
+        assert_ne!(pick_port_for(dir).unwrap(), first);
         drop(held);
-        assert_eq!(pick_port_for(&dir).unwrap(), first);
+        if pick_port_for(dir).unwrap() != first {
+            return false;
+        }
         // Garbage or a privileged port: start over.
         std::fs::write(dir.join(PORT_FILE), "80").unwrap();
-        let fresh = pick_port_for(&dir).unwrap();
+        let fresh = pick_port_for(dir).unwrap();
         assert!(fresh >= 1024);
-        assert_eq!(pick_port_for(&dir).unwrap(), fresh);
-        let _ = std::fs::remove_dir_all(&dir);
+        pick_port_for(dir).unwrap() == fresh
     }
 
     #[test]
