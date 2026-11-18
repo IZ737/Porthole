@@ -118,3 +118,7 @@ try {
     Stop-Process -Id $server.Id -Force -ErrorAction SilentlyContinue
     Remove-Item -LiteralPath $work -Recurse -Force -ErrorAction SilentlyContinue
 }
+
+# The last install run above failed on purpose; do not let its exit code
+# become this script's.
+exit 0
