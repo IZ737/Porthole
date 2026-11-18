@@ -24,7 +24,7 @@ from typing import Any, Awaitable, Callable, MutableMapping, Optional
 from urllib.parse import unquote_plus
 
 __all__ = ["PortholeAuth", "COOKIE_NAME"]
-__version__ = "0.4.0"
+__version__ = "1.0.0"
 
 COOKIE_NAME = "app_session"
 

@@ -283,6 +283,7 @@ jobs:
           $p pack examples/hello-titlebar/app.toml --target x86_64-pc-windows-msvc -o out/HelloTitleBar.exe
           $p inspect out/HelloTitleBar.exe | tee /tmp/inspect.txt
           grep -q "Windows x86_64, GUI subsystem" /tmp/inspect.txt
+          grep -q "file icon *16, 24, 32, 48, 64, 256 px" /tmp/inspect.txt
           $p pack examples/hello-titlebar/app.toml --target aarch64-apple-darwin --macos-app -o out/HelloTitleBar.app
           $p inspect out/HelloTitleBar.app | tee /tmp/inspect.txt
           grep -q "macOS aarch64" /tmp/inspect.txt
@@ -339,6 +340,14 @@ jobs:
           $sig = Get-AuthenticodeSignature out\HelloTitleBar.exe
           if ($null -eq $sig.SignerCertificate) { throw "not signed" }
           "signed: $before -> $((Get-Item out\HelloTitleBar.exe).Length) bytes"
+          # Explorer's icon for the file comes from the resources pack
+          # added: the example's icon is a blue disc.
+          Add-Type -AssemblyName System.Drawing
+          $icon = [System.Drawing.Icon]::ExtractAssociatedIcon((Resolve-Path out\HelloTitleBar.exe).Path)
+          $bmp = $icon.ToBitmap()
+          $px = $bmp.GetPixel([int]($bmp.Width / 2), [int]($bmp.Height / 2))
+          "file icon: $($bmp.Width)x$($bmp.Height), centre $px"
+          if ($px.B -lt 150 -or $px.R -gt 100) { throw "the exe does not show the app icon" }
 
       - uses: actions/download-artifact@v4
         if: runner.os == 'Windows'

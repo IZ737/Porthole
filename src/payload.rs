@@ -75,7 +75,8 @@ impl Footer {
         };
         if footer.version != VERSION {
             bail!(
-                "this app was packed with footer format {}, but this launcher reads format {VERSION}",
+                "this app was packed with footer format {}, but this launcher reads format \
+                 {VERSION}; pack it again with this version of Porthole",
                 footer.version
             );
         }
@@ -151,9 +152,9 @@ fn read_footer_from(file: &mut File) -> Result<Option<Footer>> {
     Ok(Some(footer))
 }
 
-/// Recorded by `pack` in `pack.toml`.
+/// Recorded by `pack` in `pack.toml`. Readers ignore keys they don't know,
+/// so later 1.x versions can record more (see FORMAT.md).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
 pub struct PackInfo {
     /// The Porthole version that packed the app.
     pub porthole_version: String,
@@ -472,6 +473,110 @@ mod tests {
         assert_eq!(&bytes[..8], b"PRTHOLE\0");
         assert_eq!(Footer::decode(&bytes).unwrap(), Some(footer()));
         assert_eq!(footer().cache_key(), "0707070707070707");
+    }
+
+    /// The v1 footer layout is frozen for every 1.x release (FORMAT.md).
+    #[test]
+    fn footer_v1_layout_is_frozen() {
+        let f = Footer {
+            version: 1,
+            payload_offset: 0x0102_0304_0506_0708,
+            payload_len: 0x1112_1314_1516_1718,
+            sha256: std::array::from_fn(|i| i as u8),
+        };
+        let expected = "505254484f4c450001000807060504030201181716151413121100\
+                        0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
+        assert_eq!(hex(&f.encode()), expected);
+        assert_eq!(MAGIC, *b"PRTHOLE\0");
+        assert_eq!((VERSION, FOOTER_LEN), (1, 58));
+    }
+
+    const FIXTURE: &[u8] = include_bytes!("testdata/packed-v1.bin");
+    const FIXTURE_LAUNCHER: &[u8] = b"not a real launcher\n";
+
+    /// Payload of the frozen fixture. `pack.toml` carries a key no release
+    /// writes, standing in for one a later 1.x might add.
+    fn fixture_payload() -> Vec<u8> {
+        let mut tar = tar::Builder::new(Vec::new());
+        tar.mode(tar::HeaderMode::Deterministic);
+        let mut add = |name: &str, body: &[u8], mode: u32| {
+            let mut h = tar::Header::new_gnu();
+            h.set_size(body.len() as u64);
+            h.set_mode(mode);
+            h.set_mtime(0);
+            h.set_entry_type(tar::EntryType::Regular);
+            tar.append_data(&mut h, name, body).unwrap();
+        };
+        add(
+            APP_TOML,
+            b"[app]\nname = \"Fixture\"\nid = \"dev.porthole.fixture\"\n\n[static]\nroot = \"app\"\n",
+            0o644,
+        );
+        add(
+            PACK_TOML,
+            b"porthole_version = \"1.0.0\"\ndevtools = false\nfiles = 1\nunpacked_bytes = 16\nadded_in_a_later_release = true\n",
+            0o644,
+        );
+        add("app/index.html", b"<h1>frozen</h1>\n", 0o644);
+        zstd::encode_all(tar.into_inner().unwrap().as_slice(), 19).unwrap()
+    }
+
+    /// Writes `src/testdata/packed-v1.bin`. Never re-run it to make
+    /// `reads_the_frozen_v1_fixture` pass: a 1.x launcher must keep
+    /// reading the bytes as committed.
+    #[test]
+    #[ignore = "writes the fixture"]
+    fn write_v1_fixture() {
+        let payload = fixture_payload();
+        let footer = Footer {
+            version: 1,
+            payload_offset: FIXTURE_LAUNCHER.len() as u64,
+            payload_len: payload.len() as u64,
+            sha256: Sha256::digest(&payload).into(),
+        };
+        let mut out = FIXTURE_LAUNCHER.to_vec();
+        out.extend_from_slice(&payload);
+        out.extend_from_slice(&footer.encode());
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/testdata/packed-v1.bin");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, out).unwrap();
+    }
+
+    #[test]
+    fn reads_the_frozen_v1_fixture() {
+        let dir = std::env::temp_dir().join(format!("porthole-fixture-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let exe = dir.join("Fixture.exe");
+        std::fs::write(&exe, FIXTURE).unwrap();
+        assert!(FIXTURE.starts_with(FIXTURE_LAUNCHER));
+
+        let footer = read_footer(&exe).unwrap().unwrap();
+        assert_eq!(footer.version, 1);
+        assert_eq!(footer.payload_offset, FIXTURE_LAUNCHER.len() as u64);
+        assert_eq!(
+            footer.payload_offset + footer.payload_len + FOOTER_LEN as u64,
+            FIXTURE.len() as u64
+        );
+        let payload = Payload::new(&exe, &footer);
+        let (app_toml, info) = payload.read_meta().unwrap();
+        assert!(app_toml.contains("dev.porthole.fixture"));
+        assert_eq!(info.porthole_version, "1.0.0");
+        assert_eq!(
+            (info.devtools, info.files, info.unpacked_bytes),
+            (false, 1, 16)
+        );
+        crate::config::Config::parse(&app_toml, Path::new(".")).unwrap();
+
+        let files = payload.load_app_files(1 << 20).unwrap().unwrap();
+        assert_eq!(files["index.html"], b"<h1>frozen</h1>\n");
+        let out = dir.join("x");
+        std::fs::create_dir_all(&out).unwrap();
+        payload.extract(&out).unwrap();
+        assert_eq!(
+            std::fs::read(out.join("app/index.html")).unwrap(),
+            b"<h1>frozen</h1>\n"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

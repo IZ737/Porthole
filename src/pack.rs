@@ -7,7 +7,7 @@
 //! in `Contents/Resources` (see [`crate::macos_app`]).
 
 use std::fs::{self, File};
-use std::io::{self, BufWriter, Write};
+use std::io::{self, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -20,6 +20,7 @@ use crate::launcher;
 use crate::macos_app;
 use crate::payload::{self, APP_DIR, APP_TOML, FOOTER_LEN, Footer, PACK_TOML, PackInfo, Payload};
 use crate::sidecar;
+use crate::win_icon;
 
 /// zstd level for `pack`: slow to compress, fast to decompress, and it
 /// only runs once.
@@ -303,15 +304,30 @@ pub fn pack_with(config_path: &Path, opts: PackOptions, launcher: &Path) -> Resu
     } else {
         (|| -> Result<(Footer, u64)> {
             let mut out = BufWriter::new(File::create(&tmp_output)?);
-            io::copy(
-                &mut io::Read::take(File::open(launcher)?, launcher_len),
-                &mut out,
-            )
-            .context("could not copy the launcher")?;
-            if let Some(header) = &pe {
-                out.flush()?;
-                exe::prepare_windows_copy(out.get_mut(), header)?;
-            }
+            let launcher_len = match &pe {
+                // Windows: patch the launcher's headers, and add the icon
+                // Explorer shows for the file.
+                Some(header) => {
+                    let mut image = Vec::with_capacity(launcher_len as usize);
+                    io::Read::take(File::open(launcher)?, launcher_len)
+                        .read_to_end(&mut image)
+                        .context("could not read the launcher")?;
+                    exe::prepare_windows_copy(&mut image, header);
+                    if let Some((_, png)) = &icon {
+                        add_windows_icon(&mut image, png);
+                    }
+                    out.write_all(&image)?;
+                    image.len() as u64
+                }
+                None => {
+                    io::copy(
+                        &mut io::Read::take(File::open(launcher)?, launcher_len),
+                        &mut out,
+                    )
+                    .context("could not copy the launcher")?;
+                    launcher_len
+                }
+            };
             let (mut out, payload_len, sha256) = write_payload(out, &contents)?;
             let footer = Footer {
                 version: payload::VERSION,
@@ -364,6 +380,21 @@ pub fn pack_with(config_path: &Path, opts: PackOptions, launcher: &Path) -> Resu
         bundle: opts.macos_app,
         total_bytes,
     })
+}
+
+/// Give a Windows launcher image `png` as its file icon, or warn why not.
+fn add_windows_icon(image: &mut Vec<u8>, png: &[u8]) {
+    let warn = |why: String| {
+        eprintln!("porthole: warning: the .exe file gets no icon in Explorer: {why}");
+    };
+    match win_icon::images(png) {
+        Ok(images) => match win_icon::embed(image, &images) {
+            Ok(true) => {}
+            Ok(false) => warn("the launcher has no room for another section".into()),
+            Err(err) => warn(format!("{err:#}")),
+        },
+        Err(err) => warn(format!("`app.icon` is not a usable PNG ({err:#})")),
+    }
 }
 
 /// Everything that goes into the payload.
@@ -442,6 +473,22 @@ pub fn inspect(path: &Path) -> Result<()> {
                 "  signature        Authenticode, {} at offset {at}",
                 size(file_len - at)
             );
+        }
+        if matches!(kind, exe::Kind::Pe { .. }) {
+            let mut image = Vec::new();
+            File::open(launcher)?.take(len).read_to_end(&mut image)?;
+            let sides = match win_icon::read_icon(&image) {
+                Ok(icon) if !icon.is_empty() => {
+                    icon.iter()
+                        .map(|(side, _)| side.to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                        + " px"
+                }
+                Ok(_) => "none".to_owned(),
+                Err(err) => format!("unreadable ({err:#})"),
+            };
+            println!("  file icon        {sides}");
         }
     }
     println!(

@@ -43,6 +43,7 @@ mod ready;
 mod sidecar;
 mod static_site;
 mod target;
+mod win_icon;
 mod window;
 mod window_api;
 mod window_state;
