@@ -34,8 +34,10 @@ pub fn decode_png(bytes: &[u8]) -> Result<Rgba> {
     let pixels = match frame.color_type {
         png::ColorType::Rgba => buf,
         png::ColorType::GrayscaleAlpha => buf
-            .chunks_exact(2)
-            .flat_map(|p| [p[0], p[0], p[0], p[1]])
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .flat_map(|&[v, a]| [v, v, v, a])
             .collect(),
         other => bail!("unexpected PNG colour type {other:?}"),
     };
