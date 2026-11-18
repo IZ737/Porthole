@@ -259,6 +259,12 @@ jobs:
           pattern: porthole-*
           path: artifacts
 
+      # The Linux launcher links WebKitGTK even when used as the CLI.
+      - name: Install the WebKitGTK runtime
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-0
+
       - name: Cross-pack from a local release
         env:
           PORTHOLE_CACHE_DIR: /tmp/porthole-cache
