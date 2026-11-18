@@ -13,6 +13,7 @@ import hmac
 import html
 import os
 import signal
+import socketserver
 import sys
 from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -90,6 +91,14 @@ signal.signal(signal.SIGTERM, stop)
 if hasattr(signal, "SIGBREAK"):  # Windows: Porthole sends Ctrl+Break
     signal.signal(signal.SIGBREAK, stop)
 
-server = ThreadingHTTPServer(("127.0.0.1", PORT), Handler)
+class Server(ThreadingHTTPServer):
+    def server_bind(self):
+        # HTTPServer.server_bind looks up the host's name with
+        # socket.getfqdn, which can stall for half a minute on macOS.
+        socketserver.TCPServer.server_bind(self)
+        self.server_name, self.server_port = self.server_address[:2]
+
+
+server = Server(("127.0.0.1", PORT), Handler)
 print(f"listening on 127.0.0.1:{PORT}", flush=True)
 server.serve_forever()
