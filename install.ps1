@@ -67,7 +67,7 @@
             Invoke-WebRequest -Uri $sumsUrl -OutFile $sumsPath -UseBasicParsing
         } catch {
             $which = if ($version) { " v$version" } else { '' }
-            Fail "could not download SHA256SUMS. Is there a release$which? ($($_.Exception.Message))"
+            Fail "could not download SHA256SUMS. Is there a release${which}? ($($_.Exception.Message))"
         }
 
         # Lines look like "<sha256>  porthole-1.0.0-<target>.exe". Taking the
