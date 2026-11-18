@@ -195,8 +195,18 @@ mod tests {
         assert!(rx.recv_timeout(Duration::from_millis(300)).is_err());
 
         // Once the first instance goes away, the next launch is primary.
+        // Other tests in this process fork children (sidecars, the macOS
+        // reaper); a child forked while the lock was held shares it until it
+        // execs or closes its descriptors, so allow a moment for that.
         drop(guard);
-        assert!(matches!(acquire(&dir).unwrap(), Instance::Primary(_)));
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !matches!(acquire(&dir).unwrap(), Instance::Primary(_)) {
+            assert!(
+                Instant::now() < deadline,
+                "lock still held after the primary went away"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
         let _ = fs::remove_dir_all(&dir);
     }
 }

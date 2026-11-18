@@ -1,0 +1,23 @@
+# A sidecar app with a FastAPI backend, protected by the auth kit's
+# middleware (auth-kit/python).
+#
+#   cd examples/hello-fastapi && pip install -r requirements.txt
+#   porthole run app.toml --console
+
+[app]
+name = "Hello FastAPI"
+id = "dev.porthole.hello-fastapi"
+
+[window]
+width = 900
+height = 600
+
+[sidecar]
+path = "."
+command = "python3"
+args = ["server.py"]
+ready_path = "/"            # answers 401 without the cookie, which counts as ready
+
+# Windows installs Python as `python`.
+[sidecar.windows]
+command = "python"

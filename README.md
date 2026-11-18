@@ -5,10 +5,11 @@ opens the app's local URL in the operating system's own webview (WebView2,
 WKWebView or WebKitGTK), so the launcher stays around 1–3 MB instead of
 shipping a browser.
 
-> **Status: v0.3.** Porthole can start your backend as a sidecar, serve a
+> **Status: v0.4.** Porthole can start your backend as a sidecar, serve a
 > static site itself, or open a window on a server you have already
 > started, and `pack` turns any of the first two into a single executable.
-> The auth kit (v0.4) is next. See the [roadmap](#roadmap).
+> The [auth kit](auth-kit) protects a sidecar in one line for Express and
+> FastAPI. Release polish (v0.5) is next. See the [roadmap](#roadmap).
 
 ## Pack an app into one executable
 
@@ -156,14 +157,11 @@ If `path` is a single executable, `command` can be left out.
 | `APP_TOKEN` | 64 hex characters | Per-launch secret (absent when `auth.enabled = false`) |
 | `APP_DATA_DIR` | see below | Writable per-user folder for the app |
 
-The working directory is the sidecar's folder. The window's first request
-is `http://127.0.0.1:<port>/?token=<APP_TOKEN>`. The backend should check
-the token in constant time, set the cookie
-`app_session=<APP_TOKEN>; HttpOnly; SameSite=Strict; Path=/`, redirect to
-the same path without the query string, and answer 401 to any other
-request without that cookie. It should also reject requests whose `Host`
-header isn't `127.0.0.1:<port>` or `localhost:<port>`. The example server
-shows all of this in about 30 lines of standard-library Python.
+The working directory is the sidecar's folder. The backend must enforce
+the [auth handshake](#auth-handshake): the [auth kit](auth-kit) does it in
+one line for Express and FastAPI, and
+[`examples/hello-python`](examples/hello-python) shows it in about 30
+lines of standard-library Python.
 
 ### Startup, shutdown and crashes
 
@@ -203,6 +201,90 @@ primary display.
 
 Set `PORTHOLE_NO_DIALOGS=1` to skip error dialogs on headless machines
 such as CI; errors still go to stderr and the log.
+
+## Auth handshake
+
+A sidecar listens on a TCP port, so anything on the machine could talk to
+it: another local process, or a web page in the user's browser calling
+`http://127.0.0.1:<port>`. The handshake makes sure only Porthole's window
+gets in. Porthole generates the secret; your backend enforces it. This
+section is the specification; the [auth kit](auth-kit) middlewares are
+conveniences that follow it.
+
+**What Porthole does.** It generates a token of 32 random bytes, passes it
+to the backend as `APP_TOKEN` (64 lowercase hex characters) along with
+`APP_PORT`, and loads `http://127.0.0.1:<APP_PORT>/?token=<APP_TOKEN>` in
+the window. That is the only URL that ever carries the token. With
+`auth.enabled = false` in `app.toml`, it sets no `APP_TOKEN` and loads
+`http://127.0.0.1:<APP_PORT>/`.
+
+**What the backend must do**, for every request, in this order:
+
+1. **Listen on `127.0.0.1:<APP_PORT>` only**, never `0.0.0.0` or `::`.
+2. **Check the `Host` header.** It must be `127.0.0.1:<port>` or
+   `localhost:<port>` (hostname compared case-insensitively), where
+   `<port>` is the port the backend listens on. Anything else, including a
+   missing `Host`, gets **403**. This stops DNS rebinding, where an
+   attacker's domain resolves to `127.0.0.1` and the browser treats your
+   backend as part of the attacker's site.
+3. **Handshake.** If the query string has a `token` parameter (URL-decoded)
+   equal to `APP_TOKEN`, compared in constant time, answer **302** with
+   - `Set-Cookie: app_session=<APP_TOKEN>; HttpOnly; SameSite=Strict; Path=/`
+   - `Location:` the same path with the `token` parameter removed. Other
+     query parameters should be kept as they were. The location must be a
+     path on the same origin (`//host/...` would leave it).
+   - `Cache-Control: no-store`
+4. **Session.** Otherwise, if the request has an `app_session` cookie
+   equal to `APP_TOKEN`, compared in constant time, serve it normally.
+   A `token` parameter that doesn't match is not an error by itself: a
+   request with a valid cookie is served, so the app can use `?token=` for
+   its own purposes.
+5. **Everything else gets 401**, with no cookie set. That covers every
+   method and path, including the API, static files and WebSocket
+   upgrades. A WebSocket upgrade needs the cookie: it can't follow the
+   handshake redirect. There is no need to exempt a health check: the
+   readiness probe (`ready_path`) treats 401 and 403 as "up".
+
+The webview stores the cookie and sends it with every later request,
+including `fetch()` and WebSocket connections from the page.
+`SameSite=Strict` keeps a page from another site from sending it, and
+`HttpOnly` keeps it out of reach of scripts. The cookie is not `Secure`,
+because the connection is plain HTTP on loopback.
+
+**Standalone mode.** When a developer runs the backend directly, without
+Porthole, there is no `APP_TOKEN`. A backend may then skip steps 3 to 5,
+but only when the developer opts in explicitly, such as with a
+`--standalone` flag; a missing token must not silently turn auth off.
+Keep the `Host` check. The auth kit raises an error at startup unless
+standalone mode was asked for, and prints a warning when it is on. The
+same applies under `auth.enabled = false`.
+
+**Logging.** The first request's query string holds the token, so log
+paths, not full URLs.
+
+### What it protects against
+
+| Threat | Stopped by |
+| --- | --- |
+| A website in the user's browser calls `http://127.0.0.1:<port>` | The random port, and the token cookie: the user's browser doesn't have it (it lives in the webview's own profile), and `SameSite=Strict` would keep it off cross-site requests anyway |
+| DNS rebinding (an attacker's domain resolves to `127.0.0.1`) | The `Host` check |
+| Another local process calls the API | The token, which it doesn't know |
+| The token leaking through the URL | It is in the URL for the first request only, then swapped for an `HttpOnly` cookie and redirected away |
+| Same-user malware reading `APP_TOKEN` from the process environment | Not covered. Same-user code can already read the app's files and memory |
+
+### Testing your own backend
+
+[`auth-kit/conformance.py`](auth-kit/conformance.py) starts a backend the
+way Porthole does and runs 27 checks against it, covering every rule
+above. It needs only Python 3:
+
+```sh
+python3 auth-kit/conformance.py -- node server.js
+python3 auth-kit/conformance.py --path /index.html -- ./my-server
+```
+
+`--path` names a page the backend serves with a 2xx once authenticated
+(default `/`). CI runs it against both middlewares and all three examples.
 
 ## Open a window on a running server
 
@@ -257,7 +339,8 @@ Platform requirements, at build time and on the user's machine:
 
 CI builds and tests on Ubuntu 24.04, macOS (arm64) and Windows, including
 a test that kills a stand-in launcher outright and checks its sidecar dies
-with it, and runs window smoke tests on Linux under Xvfb. The sidecar tests
+with it, and runs window smoke tests on Linux under Xvfb, including one
+that checks a real webview completes the auth handshake. The sidecar tests
 use Python, and skip themselves where it is not installed.
 
 ## Roadmap
@@ -267,7 +350,8 @@ use Python, and skip themselves where it is not installed.
    `APP_TOKEN` and `APP_DATA_DIR`, waits for it, and stops it with the window.
 3. **v0.3 — Pack.** `pack` and `inspect`: one executable with the backend
    (or a static site, served from memory) inside.
-4. **v0.4 — Auth kit.** The token handshake spec and reference middlewares.
+4. **v0.4 — Auth kit.** The [handshake spec](#auth-handshake), reference
+   middlewares for Express and FastAPI/Starlette, and a conformance test.
 5. **v0.5 — Release polish.** Title bar modes, downloads, signing,
    cross-packing, prebuilt launchers.
 

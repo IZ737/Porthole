@@ -1,0 +1,5 @@
+fastapi
+uvicorn
+# The auth kit, from this repository (paths are relative to this folder;
+# run pip from here).
+../../auth-kit/python

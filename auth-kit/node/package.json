@@ -1,0 +1,16 @@
+{
+  "name": "porthole-auth",
+  "version": "0.4.0",
+  "description": "Porthole's auth handshake as middleware for Express, Connect and node:http",
+  "main": "index.js",
+  "types": "index.d.ts",
+  "files": ["index.js", "index.d.ts"],
+  "license": "MIT OR Apache-2.0",
+  "engines": { "node": ">=18" },
+  "scripts": {
+    "test": "node --test test/*.test.js"
+  },
+  "devDependencies": {
+    "express": "^5.1.0"
+  }
+}

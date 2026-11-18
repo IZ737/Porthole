@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "porthole-auth"
+version = "0.4.0"
+description = "Porthole's auth handshake as ASGI middleware for FastAPI and Starlette"
+readme = "README.md"
+license = "MIT OR Apache-2.0"
+requires-python = ">=3.9"
+dependencies = []
+
+[project.optional-dependencies]
+test = ["pytest", "starlette", "fastapi", "httpx", "uvicorn"]
+
+[tool.setuptools]
+packages = ["porthole_auth"]

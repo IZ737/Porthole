@@ -119,6 +119,51 @@ jobs:
             if grep -q "no file for" /tmp/static.log; then echo "a page asset 404ed"; exit 1; fi
           '
 
+      # Launches the Express and FastAPI examples in a real webview and
+      # checks the page's own API call gets through the auth handshake
+      # (302, HttpOnly cookie, cookie sent on fetch).
+      # Launches the Express and FastAPI examples in a real webview and
+      # checks the page's own API call gets through the auth handshake
+      # (302, HttpOnly cookie, cookie sent on fetch).
+      # TEMPORARY: find out why the page doesn't load on the runner.
+      - name: Webview diagnostics (Linux)
+        if: runner.os == 'Linux'
+        continue-on-error: true
+        run: |
+          sysctl kernel.apparmor_restrict_unprivileged_userns kernel.unprivileged_userns_clone user.max_user_namespaces || true
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+          bwrap --ro-bind / / true && echo "bwrap ok" || echo "bwrap FAILED"
+          (cd examples/hello-express && npm ci --install-links)
+          echo "DBUS_SESSION_BUS_ADDRESS=${DBUS_SESSION_BUS_ADDRESS-unset} XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR-unset}"
+          try() {
+            echo "=== $*"
+            "$@" bash -c '
+              export XDG_DATA_HOME=$(mktemp -d) PORTHOLE_NO_DIALOGS=1
+              echo "bus: ${DBUS_SESSION_BUS_ADDRESS-unset}"
+              ./target/release/porthole run examples/hello-express/app.toml --console > /tmp/ph.log 2>&1 & pid=$!
+              sleep 8
+              ps -eo pid,args | grep -i -E "webkit|bwrap|dbus" | grep -v grep
+              sudo gdb -p $pid -batch -ex "thread apply all bt 12" 2>/dev/null | grep -E "^#|^Thread" | head -60
+              kill $pid; sleep 1
+              grep -v "^$" /tmp/ph.log | grep -v -i "a11y" | tail -15
+            '
+          }
+          try xvfb-run -a
+          try env -u DBUS_SESSION_BUS_ADDRESS xvfb-run -a
+          try dbus-run-session -- xvfb-run -a
+
+      - name: Auth kit in a webview (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          (cd examples/hello-express && npm ci --install-links)
+          # requirements.txt paths are relative to the folder pip runs in.
+          (cd examples/hello-fastapi && python3 -m pip install --user --break-system-packages -r requirements.txt)
+          # A private session bus: on the runner, GLib otherwise finds the
+          # systemd user bus in $XDG_RUNTIME_DIR and hangs authenticating to
+          # it, and WebKit never starts its web process (no page loads).
+          dbus-run-session -- xvfb-run -a auth-kit/webview-e2e.sh ./target/release/porthole examples/hello-express/app.toml dev.porthole.hello-express
+          dbus-run-session -- xvfb-run -a auth-kit/webview-e2e.sh ./target/release/porthole examples/hello-fastapi/app.toml dev.porthole.hello-fastapi
+
       - uses: actions/upload-artifact@v4
         with:
           name: porthole-${{ runner.os }}-${{ runner.arch }}
@@ -126,3 +171,53 @@ jobs:
             target/release/porthole
             target/release/porthole.exe
           if-no-files-found: error
+
+  # The auth kit's middlewares, on every OS: their own tests, then the
+  # shared conformance checks against them and the three example backends.
+  auth-kit:
+    name: Auth kit (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install
+        run: |
+          (cd auth-kit/node && npm ci)
+          (cd examples/hello-express && npm ci --install-links)
+          python -m pip install -e 'auth-kit/python[test]'
+          (cd examples/hello-fastapi && python -m pip install -r requirements.txt)
+
+      - name: Node tests
+        working-directory: auth-kit/node
+        run: npm test
+
+      - name: Python tests
+        working-directory: auth-kit/python
+        run: python -m pytest -q
+
+      - name: Conformance
+        run: |
+          set -e
+          c="python auth-kit/conformance.py --"
+          $c node auth-kit/node/test/fixtures/express-server.js
+          $c node auth-kit/node/test/fixtures/http-server.js
+          $c python auth-kit/python/tests/fixtures/fastapi_server.py
+          $c python auth-kit/python/tests/fixtures/starlette_server.py
+          $c python examples/hello-python/server.py
+          $c node examples/hello-express/server.js
+          $c python examples/hello-fastapi/server.py

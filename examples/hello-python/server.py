@@ -3,7 +3,7 @@
 It follows the backend contract from the Porthole design:
 1. Listen on 127.0.0.1:$APP_PORT only.
 2. On `?token=<APP_TOKEN>`, set the `app_session` cookie and redirect to
-   the same path without the query string.
+   the same path without the token.
 3. Require that cookie on every other request (401 otherwise).
 4. Reject requests whose Host header isn't 127.0.0.1:<port> or
    localhost:<port> (DNS rebinding).
@@ -13,6 +13,7 @@ import hmac
 import html
 import os
 import signal
+import socketserver
 import sys
 from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -41,7 +42,11 @@ class Handler(BaseHTTPRequestHandler):
                     "Set-Cookie",
                     f"app_session={TOKEN}; HttpOnly; SameSite=Strict; Path=/",
                 )
-                self.send_header("Location", url.path or "/")
+                # Same path, minus the token; keep any other parameters.
+                rest = "&".join(
+                    p for p in url.query.split("&") if p.split("=", 1)[0] != "token"
+                )
+                self.send_header("Location", (url.path or "/") + (f"?{rest}" if rest else ""))
                 self.end_headers()
                 return
             cookie = SimpleCookie(self.headers.get("Cookie", ""))
@@ -57,6 +62,10 @@ class Handler(BaseHTTPRequestHandler):
 <p>Data folder: <code>{html.escape(DATA_DIR)}</code></p>
 """
         self.reply(200, page, "text/html; charset=utf-8")
+
+    # Every method goes through the same checks (a POST without the cookie
+    # gets 401 like a GET would).
+    do_POST = do_PUT = do_PATCH = do_DELETE = do_GET
 
     def reply(self, status, body, content_type):
         data = body.encode()
@@ -82,6 +91,14 @@ signal.signal(signal.SIGTERM, stop)
 if hasattr(signal, "SIGBREAK"):  # Windows: Porthole sends Ctrl+Break
     signal.signal(signal.SIGBREAK, stop)
 
-server = ThreadingHTTPServer(("127.0.0.1", PORT), Handler)
+class Server(ThreadingHTTPServer):
+    def server_bind(self):
+        # HTTPServer.server_bind looks up the host's name with
+        # socket.getfqdn, which can stall for half a minute on macOS.
+        socketserver.TCPServer.server_bind(self)
+        self.server_name, self.server_port = self.server_address[:2]
+
+
+server = Server(("127.0.0.1", PORT), Handler)
 print(f"listening on 127.0.0.1:{PORT}", flush=True)
 server.serve_forever()
