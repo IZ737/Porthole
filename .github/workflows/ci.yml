@@ -119,6 +119,21 @@ jobs:
             if grep -q "no file for" /tmp/static.log; then echo "a page asset 404ed"; exit 1; fi
           '
 
+      # Launches the Express and FastAPI examples in a real webview and
+      # checks the page's own API call gets through the auth handshake
+      # (302, HttpOnly cookie, cookie sent on fetch).
+      - name: Auth kit in a webview (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          # WebKitGTK sandboxes its web process with bubblewrap, which needs
+          # unprivileged user namespaces; Ubuntu 24.04's AppArmor limits them.
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          (cd examples/hello-express && npm ci --install-links)
+          # requirements.txt paths are relative to the folder pip runs in.
+          (cd examples/hello-fastapi && python3 -m pip install --user --break-system-packages -r requirements.txt)
+          xvfb-run -a auth-kit/webview-e2e.sh ./target/release/porthole examples/hello-express/app.toml dev.porthole.hello-express
+          xvfb-run -a auth-kit/webview-e2e.sh ./target/release/porthole examples/hello-fastapi/app.toml dev.porthole.hello-fastapi
+
       - uses: actions/upload-artifact@v4
         with:
           name: porthole-${{ runner.os }}-${{ runner.arch }}
@@ -176,37 +191,3 @@ jobs:
           $c python examples/hello-python/server.py
           $c node examples/hello-express/server.js
           $c python examples/hello-fastapi/server.py
-
-  # Launches the Express and FastAPI examples with the real launcher in a
-  # real webview and checks the page's own API call gets through the
-  # handshake (302, HttpOnly cookie, cookie on fetch).
-  auth-kit-webview:
-    name: Auth kit in a webview (Linux)
-    needs: build
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/download-artifact@v4
-        with:
-          name: porthole-Linux-X64
-          path: bin
-
-      - name: Install
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.1-0 xvfb
-          # WebKitGTK sandboxes its web process with bubblewrap, which needs
-          # unprivileged user namespaces; Ubuntu 24.04's AppArmor blocks
-          # them by default, and the page then never loads.
-          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
-          chmod +x bin/porthole
-          (cd examples/hello-express && npm ci --install-links)
-          # requirements.txt paths are relative to the folder pip runs in.
-          (cd examples/hello-fastapi && python3 -m pip install --user --break-system-packages -r requirements.txt)
-
-      - name: Express example
-        run: xvfb-run -a auth-kit/webview-e2e.sh bin/porthole examples/hello-express/app.toml dev.porthole.hello-express
-
-      - name: FastAPI example
-        run: xvfb-run -a auth-kit/webview-e2e.sh bin/porthole examples/hello-fastapi/app.toml dev.porthole.hello-fastapi
